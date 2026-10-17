@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 #![no_std]
 use soroban_sdk::{
-    contract, contracterror, contractevent, contractimpl, contracttype, symbol_short, Address,
-    Bytes, BytesN, Env, String, Vec,
+    contract, contracterror, contractevent, contractimpl, contracttype, Address, Bytes, BytesN,
+    Env, String, Vec,
 };
 
 #[contractevent(topics = ["register"], data_format = "single-value")]
