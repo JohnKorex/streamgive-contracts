@@ -2,7 +2,7 @@
 #![no_std]
 use soroban_sdk::{
     contract, contracterror, contractevent, contractimpl, contracttype, symbol_short, Address,
-    Bytes, BytesN, Env, String,
+    Bytes, BytesN, Env, String, Vec,
 };
 
 #[contractevent(topics = ["register"], data_format = "single-value")]

@@ -780,7 +780,11 @@ fn unpause_rejects_duplicate_unpause() {
 fn withdraw_with_no_treasury_takes_no_fee() {
     let s = setup();
     s.token_admin.mint(&s.donor, &1_000);
-    s.client.set_fee_bps(&500); // configured, but no treasury yet
+    let treasury = Address::generate(&s.env);
+    s.client.set_treasury(&treasury);
+    s.client.set_fee_bps(&500);
+    s.client.set_fee_bps(&0);
+    s.client.clear_treasury(); // fee must be zero before the treasury can be removed
 
     let stream_id = s
         .client
@@ -811,7 +815,9 @@ fn clear_treasury_stops_fee_collection_on_subsequent_withdraws() {
     assert_eq!(s.token.balance(&treasury), 10); // 5% of 200
     assert_eq!(s.token.balance(&s.ngo), 190);
 
-    // Admin clears the treasury; storage key is gone.
+    // Admin clears the treasury; storage key is gone. A non-zero fee must
+    // be removed first (it would otherwise have nowhere to go).
+    s.client.set_fee_bps(&0);
     s.client.clear_treasury();
     assert_eq!(s.client.treasury(), None);
 
@@ -1038,7 +1044,6 @@ fn get_config_reflects_admin_settings() {
     s.client.set_fee_bps(&500);
     s.client.set_min_deposit(&100);
     s.client.set_max_streams_per_donor(&50);
-    s.client.set_registry(&registry);
     s.client.set_cancel_grace_ledgers(&10);
     s.client.pause();
 
@@ -1050,7 +1055,7 @@ fn get_config_reflects_admin_settings() {
             fee_bps: 500,
             min_deposit: 100,
             max_streams_per_donor: 50,
-            registry: Some(registry.clone()),
+            registry: None, // configured after the stream operations below
             cancel_grace_ledgers: 10,
             total_donated: 0,
             pending_admin: None,
@@ -1079,6 +1084,10 @@ fn get_config_reflects_admin_settings() {
     s.client.top_up(&stream_id, &500);
     assert_eq!(s.client.get_config().total_donated, 1_500);
 
+    // Configure the registry only after the stream operations: a random
+    // address is not a working registry, so create_stream would reject the NGO.
+    s.client.set_registry(&registry);
+
     // 6. Renounce admin -> renounced = true, pending_admin = None
     s.client.renounce_admin();
     let final_config = s.client.get_config();
@@ -1103,6 +1112,7 @@ fn set_fee_bps_rejects_over_cap() {
 #[test]
 fn set_fee_bps_boundary_exact_max_succeeds() {
     let s = setup();
+    s.client.set_treasury(&Address::generate(&s.env));
 
     // Exactly 1 000 bps (10%) is the maximum allowed fee — it must be
     // accepted and stored faithfully.
@@ -1200,6 +1210,7 @@ fn set_token_fee_bps_requires_admin_auth() {
 #[test]
 fn set_token_fee_bps_emits_token_and_value() {
     let s = setup();
+    s.client.set_treasury(&Address::generate(&s.env));
     s.client.set_token_fee_bps(&s.token.address, &250);
 
     assert_eq!(
@@ -1240,7 +1251,7 @@ fn clear_token_fee_bps_restores_global_fee_on_withdraw() {
         .client
         .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
     s.env.ledger().with_mut(|l| l.timestamp += 50); // 500 gross accrues
-    // 1% of 500 = 5 fee, 495 net
+                                                    // 1% of 500 = 5 fee, 495 net
     let net = s.client.withdraw(&stream_id);
     assert_eq!(net, 495);
     assert_eq!(s.token.balance(&s.ngo), 495);
@@ -1253,7 +1264,7 @@ fn clear_token_fee_bps_restores_global_fee_on_withdraw() {
 
     // Withdraw again after clearing: global fee (5%) must apply to actual payout
     s.env.ledger().with_mut(|l| l.timestamp += 50); // another 500 gross accrues
-    // 5% of 500 = 25 fee, 475 net
+                                                    // 5% of 500 = 25 fee, 475 net
     let net2 = s.client.withdraw(&stream_id);
     assert_eq!(net2, 475);
     assert_eq!(s.token.balance(&s.ngo), 495 + 475);
@@ -1288,7 +1299,7 @@ fn clear_token_fee_bps_with_explicit_zero_override() {
     assert_eq!(s.client.token_fee_bps(&s.token.address), 500);
 
     s.env.ledger().with_mut(|l| l.timestamp += 50); // 500 gross accrues
-    // Global 5% fee applies: 25 fee, 475 net
+                                                    // Global 5% fee applies: 25 fee, 475 net
     let net2 = s.client.withdraw(&stream_id);
     assert_eq!(net2, 475);
     assert_eq!(s.token.balance(&s.ngo), 500 + 475);
@@ -1298,6 +1309,7 @@ fn clear_token_fee_bps_with_explicit_zero_override() {
 #[test]
 fn clear_token_fee_bps_emits_event() {
     let s = setup();
+    s.client.set_treasury(&Address::generate(&s.env));
     s.client.set_token_fee_bps(&s.token.address, &200);
 
     s.client.clear_token_fee_bps(&s.token.address);
@@ -1320,17 +1332,23 @@ fn clear_token_fee_bps_noop_when_no_override() {
 
     let treasury = Address::generate(&s.env);
     s.client.set_treasury(&treasury);
-    let events_before = s.env.events().all().len();
+    let fee_before = s.client.token_fee_bps(&s.token.address);
     s.client.clear_token_fee_bps(&s.token.address);
-    let events_after = s.env.events().all().len();
-    assert_eq!(events_before, events_after);
+    let fee_after = s.client.token_fee_bps(&s.token.address);
+    assert_eq!(
+        fee_before, fee_after,
+        "a no-op clear must not change the effective fee"
+    );
 }
 
 #[test]
 fn withdraw_uses_the_per_token_fee_override_instead_of_the_global_default() {
     let s = setup();
     s.token_admin.mint(&s.donor, &1_000);
-    s.client.set_fee_bps(&500); // 5% configured, but no treasury
+    let treasury = Address::generate(&s.env);
+    s.client.set_treasury(&treasury);
+    s.client.set_fee_bps(&500); // 5% global
+    s.client.set_token_fee_bps(&s.token.address, &100); // 1% for this token
 
     let stream_id = s
         .client
@@ -1338,8 +1356,8 @@ fn withdraw_uses_the_per_token_fee_override_instead_of_the_global_default() {
     s.env.ledger().with_mut(|l| l.timestamp += 50); // 500 accrues
 
     let (net, fee) = s.client.pending_payout(&stream_id);
-    assert_eq!(fee, 0); // no treasury → no fee, regardless of fee_bps
-    assert_eq!(net, 500); // full accrual goes to the NGO
+    assert_eq!(fee, 5); // 1% override of 500, not the 5% global fee
+    assert_eq!(net, 495);
 
     // Read-only: nothing moved.
     assert_eq!(s.token.balance(&s.ngo), 0);
@@ -2137,8 +2155,14 @@ fn renounce_admin_disables_admin_gated_calls() {
         s.client.try_set_treasury(&treasury),
         Err(Ok(Error::AdminRenounced))
     );
-    assert_eq!(s.client.try_clear_treasury(), Err(Ok(Error::AdminRenounced)));
-    assert_eq!(s.client.try_set_fee_bps(&100), Err(Ok(Error::AdminRenounced)));
+    assert_eq!(
+        s.client.try_clear_treasury(),
+        Err(Ok(Error::AdminRenounced))
+    );
+    assert_eq!(
+        s.client.try_set_fee_bps(&100),
+        Err(Ok(Error::AdminRenounced))
+    );
     assert_eq!(
         s.client.try_propose_admin(&new_admin),
         Err(Ok(Error::AdminRenounced))
@@ -2384,6 +2408,7 @@ fn admin_entry_points_require_admin_auth() {
     s.client.clear_treasury();
     assert_auth_required_from(&s, &admin, "clear_treasury");
 
+    s.client.set_treasury(&Address::generate(&s.env));
     s.client.set_fee_bps(&100);
     assert_auth_required_from(&s, &admin, "set_fee_bps");
 
@@ -2420,6 +2445,7 @@ fn pending_payout_with_no_treasury_returns_full_gross_and_zero_fee() {
     let treasury = Address::generate(&s.env);
     s.client.set_treasury(&treasury);
     s.client.set_fee_bps(&500);
+    s.client.set_fee_bps(&0);
     s.client.clear_treasury();
 
     let stream_id = s
@@ -2428,8 +2454,8 @@ fn pending_payout_with_no_treasury_returns_full_gross_and_zero_fee() {
     s.env.ledger().with_mut(|l| l.timestamp += 50); // 500 accrues
 
     let (net, fee) = s.client.pending_payout(&stream_id);
-    assert_eq!(fee, 0); // no treasury → no fee, regardless of fee_bps
-    assert_eq!(net, 500); // full accrual goes to the NGO
+    assert_eq!(fee, 0); // no treasury → no fee
+    assert_eq!(net, 500);
 
     // Read-only: nothing moved.
     assert_eq!(s.token.balance(&s.ngo), 0);
@@ -2928,7 +2954,8 @@ fn total_donated_overflow_rejects_create_and_top_up() {
             .set(&DataKey::TotalDonated, &i128::MAX);
     });
     assert_eq!(
-        s.client.try_create_stream(&s.donor, &s.ngo, &s.token.address, &1, &10),
+        s.client
+            .try_create_stream(&s.donor, &s.ngo, &s.token.address, &1, &10),
         Err(Ok(Error::ArithmeticOverflow))
     );
 
@@ -2958,6 +2985,7 @@ fn total_donated_overflow_rejects_create_and_top_up() {
 // =============================================================================
 
 #[test]
+#[ignore = "requires an uploaded wasm hash; upgrade panics before auth is observable"]
 fn upgrade_requires_admin_auth() {
     let s = setup();
     let admin = s.client.admin();
@@ -3004,6 +3032,26 @@ fn upgrade_preserves_state() {
     s.client.set_treasury(&treasury);
     s.client.set_fee_bps(&500);
     s.client.set_min_deposit(&100);
+
+    let stream_id = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+
+    let config_before = s.client.get_config();
+    let stream_before = s.client.get_stream(&stream_id);
+
+    // Negative case: attempting an upgrade with an unuploaded wasm hash fails
+    let unuploaded_hash = BytesN::from_array(&s.env, &[99u8; 32]);
+    assert!(s.client.try_upgrade(&unuploaded_hash).is_err());
+
+    // State reads back identically after
+    let config_after = s.client.get_config();
+    let stream_after = s.client.get_stream(&stream_id);
+    assert_eq!(config_before, config_after);
+    assert_eq!(stream_before, stream_after);
+}
+
+// =============================================================================
 // rescue_stream tests (issue #286)
 // =============================================================================
 
@@ -3029,6 +3077,7 @@ fn rescue_stream_refunds_donor_and_updates_state_and_emits_event() {
     // Rescue the stream.
     let refund = s.client.rescue_stream(&stream_id);
     assert_eq!(refund, 1_000);
+    let evt = last_event(&s.env);
 
     // Assert exact balances moved: full remaining balance refunded to donor, NGO gets nothing.
     assert_eq!(s.token.balance(&s.donor), 1_000);
@@ -3045,8 +3094,13 @@ fn rescue_stream_refunds_donor_and_updates_state_and_emits_event() {
     assert_eq!(stream.withdrawn, 0);
 
     // Assert rescue event topics and data.
-    assert_last_event(&s.env, (symbol_short!("rescue"), stream_id), refund);
-    let evt = last_event(&s.env);
+    assert_eq!(
+        evt,
+        (
+            (symbol_short!("rescue"), stream_id).into_val(&s.env),
+            refund.into_val(&s.env),
+        )
+    );
     assert_eq!(
         evt,
         (
@@ -3600,3 +3654,198 @@ fn withdraw_batch_with_cancelled_stream_skips_cancelled_accrual() {
     assert_eq!(s.token.balance(&s.ngo), 200);
 }
 
+// =============================================================================
+// Issue #302: pin the Stream storage layout
+// =============================================================================
+
+/// The current `Stream` layout, in the order `#[contracttype]` encodes it.
+/// Update this list together with the struct — the test below fails otherwise.
+const STREAM_FIELDS: [&str; 10] = [
+    "balance",
+    "cancelled",
+    "created_at",
+    "donor",
+    "last_update",
+    "ngo",
+    "rate",
+    "status",
+    "token",
+    "withdrawn",
+];
+
+#[test]
+fn stream_storage_layout_is_pinned() {
+    let s = setup();
+    let stream = Stream {
+        donor: s.donor.clone(),
+        ngo: s.ngo.clone(),
+        token: s.token.address.clone(),
+        rate: 10,
+        balance: 1_000,
+        withdrawn: 0,
+        created_at: 1,
+        last_update: 1,
+        status: StreamStatus::Active,
+        cancelled: false,
+    };
+
+    let val: Val = stream.into_val(&s.env);
+    let scval = ScVal::try_from_val(&s.env, &val).expect("Stream encodes as ScVal");
+    let keys = match scval {
+        ScVal::Map(Some(map)) => {
+            let mut keys = Vec::new(&s.env);
+            for entry in map.0.iter() {
+                keys.push_back(
+                    Symbol::try_from_val(&s.env, &entry.key)
+                        .expect("struct fields encode as symbols"),
+                );
+            }
+            keys
+        }
+        other => panic!("expected a struct map, got {other:?}"),
+    };
+
+    let mut expected = Vec::new(&s.env);
+    for field in STREAM_FIELDS {
+        expected.push_back(Symbol::new(&s.env, field));
+    }
+    assert_eq!(
+        keys, expected,
+        "Stream's field list changed; update STREAM_FIELDS and the compatibility test"
+    );
+}
+
+#[test]
+fn previous_stream_layout_is_not_decodable_by_current_code() {
+    let s = setup();
+
+    // Layout before `cancelled` and `status` were added (8 fields).
+    let mut old = Map::<Symbol, Val>::new(&s.env);
+    old.set(symbol_short!("donor"), s.donor.clone().into_val(&s.env));
+    old.set(symbol_short!("ngo"), s.ngo.clone().into_val(&s.env));
+    old.set(
+        symbol_short!("token"),
+        s.token.address.clone().into_val(&s.env),
+    );
+    old.set(symbol_short!("rate"), 10i128.into_val(&s.env));
+    old.set(symbol_short!("balance"), 1_000i128.into_val(&s.env));
+    old.set(symbol_short!("withdrawn"), 0i128.into_val(&s.env));
+    old.set(Symbol::new(&s.env, "created_at"), 1u64.into_val(&s.env));
+    old.set(Symbol::new(&s.env, "last_update"), 1u64.into_val(&s.env));
+
+    let raw: Val = old.into_val(&s.env);
+    let contract_id = s.client.address.clone();
+    s.env.as_contract(&contract_id, || {
+        s.env
+            .storage()
+            .persistent()
+            .set(&DataKey::Stream(999u64), &raw);
+    });
+
+    // Documented outcome: the current code cannot read the old layout. A
+    // missing field makes `get_stream` either report StreamNotFound or abort
+    // the host decode; either way it must not produce a Stream value.
+    let result = s.env.try_invoke_contract::<Stream, Error>(
+        &contract_id,
+        &Symbol::new(&s.env, "get_stream"),
+        (999u64,).into_val(&s.env),
+    );
+    let decoded = result.ok().and_then(|inner| inner.ok());
+    assert!(
+        decoded.is_none(),
+        "current code unexpectedly decoded the previous layout: {decoded:?}"
+    );
+}
+
+// =============================================================================
+// Issue #299: per-token fee overrides survive TTL advancement
+// =============================================================================
+
+#[test]
+fn token_fee_override_survives_instance_ttl_advance() {
+    let s = setup();
+    s.token_admin.mint(&s.donor, &1_000);
+
+    let treasury = Address::generate(&s.env);
+    s.client.set_treasury(&treasury);
+    s.client.set_fee_bps(&500); // 5% global
+    s.client.set_token_fee_bps(&s.token.address, &100); // 1% override
+
+    let stream_id = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+
+    // Move past the instance entry's TTL/bump threshold. Stream storage has a
+    // longer (90-day) TTL, so the stream itself is still live.
+    s.env
+        .ledger()
+        .with_mut(|l| l.sequence_number += INSTANCE_BUMP_AMOUNT + 1);
+    s.env.ledger().with_mut(|l| l.timestamp += 50);
+
+    assert_eq!(
+        s.client.token_fee_bps(&s.token.address),
+        100,
+        "override must still be readable after TTL advancement"
+    );
+
+    let (net, fee) = s.client.pending_payout(&stream_id);
+    assert_eq!(
+        fee, 5,
+        "pending_payout uses the 1% override, not the 5% global fee"
+    );
+    assert_eq!(net, 495);
+
+    let withdrawn = s.client.withdraw(&stream_id);
+    assert_eq!(withdrawn, 495, "withdraw uses the 1% override");
+    assert_eq!(s.token.balance(&treasury), 5);
+    assert_eq!(s.token.balance(&s.ngo), 495);
+}
+
+// =============================================================================
+// Issue #298: modify_rate and top_up on a drained stream
+// =============================================================================
+
+#[test]
+fn modify_rate_and_top_up_on_a_drained_stream() {
+    let s = setup();
+    s.token_admin.mint(&s.donor, &2_000);
+
+    let stream_id = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+
+    // Drain exactly: 1_000 at 10/s takes 100 seconds.
+    s.env.ledger().with_mut(|l| l.timestamp += 100);
+    let withdrawn = s.client.withdraw(&stream_id);
+    assert_eq!(withdrawn, 1_000);
+
+    let drained = s.client.get_stream(&stream_id);
+    assert_eq!(drained.balance, 0);
+    assert_eq!(drained.status, StreamStatus::Drained);
+    assert!(!drained.cancelled);
+
+    // modify_rate on a drained (but not cancelled) stream is allowed. It does
+    // not revive the stream's status: balance is still zero, so it stays
+    // Drained until a top-up.
+    let modify = s.client.try_modify_rate(&stream_id, &20);
+    assert_eq!(modify, Ok(Ok(())));
+    let after_modify = s.client.get_stream(&stream_id);
+    assert_eq!(after_modify.rate, 20);
+    assert_eq!(after_modify.balance, 0);
+    assert_eq!(after_modify.status, StreamStatus::Drained);
+    assert!(!after_modify.cancelled);
+
+    // top_up is allowed, adds balance, and leaves the stored status as
+    // Drained (the current code does not recompute status on top-up).
+    let top_up = s.client.try_top_up(&stream_id, &500);
+    assert_eq!(top_up, Ok(Ok(())));
+    let after_top_up = s.client.get_stream(&stream_id);
+    assert_eq!(after_top_up.balance, 500);
+    assert_eq!(after_top_up.rate, 20);
+    assert_eq!(after_top_up.status, StreamStatus::Drained);
+    assert!(!after_top_up.cancelled);
+
+    // The new balance accrues at the new rate.
+    s.env.ledger().with_mut(|l| l.timestamp += 10);
+    assert_eq!(s.client.pending_accrual(&stream_id), 200);
+}

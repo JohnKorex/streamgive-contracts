@@ -604,7 +604,10 @@ impl DonationVault {
     /// Returns the cumulative amount deposited into all streams, including top-ups.
     /// Withdrawals and cancellations do not reduce this lifetime total.
     pub fn total_donated(env: Env) -> i128 {
-        env.storage().instance().get(&DataKey::TotalDonated).unwrap_or(0)
+        env.storage()
+            .instance()
+            .get(&DataKey::TotalDonated)
+            .unwrap_or(0)
     }
 
     /// Reads back the vault admin set by `init`.
@@ -798,6 +801,31 @@ impl DonationVault {
             .persistent()
             .get(&DataKey::Stream(stream_id))
             .ok_or(Error::StreamNotFound)
+    }
+
+    /// Lists every stream id belonging to `donor`, in creation order.
+    ///
+    /// Cancelled streams are still included because their records are kept
+    /// (callers can inspect `status`/`cancelled`). This is a read-only view.
+    pub fn streams_by_donor(env: Env, donor: Address) -> Vec<u64> {
+        let total: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::NextStreamId)
+            .unwrap_or(0);
+        let mut ids = Vec::new(&env);
+        for id in 0..total {
+            if let Some(stream) = env
+                .storage()
+                .persistent()
+                .get::<_, Stream>(&DataKey::Stream(id))
+            {
+                if stream.donor == donor {
+                    ids.push_back(id);
+                }
+            }
+        }
+        ids
     }
 
     /// Reads back the number of streams ever created — the exclusive upper
@@ -1723,7 +1751,9 @@ impl DonationVault {
             STREAM_BUMP_AMOUNT,
         );
 
-        env.storage().instance().set(&DataKey::TotalDonated, &next_total);
+        env.storage()
+            .instance()
+            .set(&DataKey::TotalDonated, &next_total);
 
         extend_instance_ttl(&env);
         extend_stream_ttl(&env, stream_id);
@@ -2206,7 +2236,9 @@ impl DonationVault {
             .checked_add(amount)
             .ok_or(Error::ArithmeticOverflow)?;
 
-        env.storage().instance().set(&DataKey::TotalDonated, &next_total);
+        env.storage()
+            .instance()
+            .set(&DataKey::TotalDonated, &next_total);
         env.storage().persistent().set(&key, &stream);
         extend_instance_ttl(&env);
         extend_stream_ttl(&env, stream_id);
