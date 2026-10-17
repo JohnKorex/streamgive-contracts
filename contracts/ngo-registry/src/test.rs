@@ -878,3 +878,102 @@ fn list_ngos_unregister_last_and_only_entry() {
 
     assert_eq!(client.list_ngos(&0, &10).len(), 0);
 }
+
+// =============================================================================
+// register and unregister auth and events (issue #294)
+// =============================================================================
+
+/// Asserts that the last call recorded exactly one authorization: `expected`
+/// authorizing `function` on the registry itself.
+fn assert_sole_auth(env: &Env, client: &NgoRegistryClient, expected: &Address, function: &str) {
+    let auths = env.auths();
+    assert_eq!(auths.len(), 1, "expected exactly one authorizer");
+    let (address, invocation) = &auths[0];
+    assert_eq!(address, expected);
+    match &invocation.function {
+        AuthorizedFunction::Contract((contract, name, _)) => {
+            assert_eq!(contract, &client.address);
+            assert_eq!(name, &Symbol::new(env, function));
+        }
+        _ => panic!("expected a contract invocation"),
+    }
+}
+
+#[test]
+fn register_requires_owner_auth() {
+    let (env, client, _admin) = setup();
+    let owner = Address::generate(&env);
+
+    client.register(&owner, &String::from_str(&env, "Red Cross"));
+
+    assert_sole_auth(&env, &client, &owner, "register");
+}
+
+#[test]
+#[should_panic]
+fn register_without_owner_auth_fails() {
+    let (env, client, _admin) = setup();
+    let owner = Address::generate(&env);
+
+    env.mock_auths(&[]);
+    client.register(&owner, &String::from_str(&env, "Red Cross"));
+}
+
+#[test]
+fn unregister_requires_owner_auth() {
+    let (env, client, _admin) = setup();
+    let owner = Address::generate(&env);
+    client.register(&owner, &String::from_str(&env, "Red Cross"));
+
+    client.unregister(&owner);
+
+    assert_sole_auth(&env, &client, &owner, "unregister");
+}
+
+#[test]
+#[should_panic]
+fn unregister_without_owner_auth_fails() {
+    let (env, client, _admin) = setup();
+    let owner = Address::generate(&env);
+    client.register(&owner, &String::from_str(&env, "Red Cross"));
+
+    env.mock_auths(&[]);
+    client.unregister(&owner);
+}
+
+#[test]
+fn unregister_publishes_event() {
+    let (env, client, _admin) = setup();
+    let owner = Address::generate(&env);
+    client.register(&owner, &String::from_str(&env, "Red Cross"));
+
+    client.unregister(&owner);
+
+    // Events are cleared per top-level call; only the unregist event is visible.
+    assert_eq!(
+        env.events().all(),
+        vec![
+            &env,
+            (
+                client.address.clone(),
+                (symbol_short!("unregist"), owner).into_val(&env),
+                ().into_val(&env),
+            ),
+        ]
+    );
+}
+
+#[test]
+fn unregister_verified_ngo_fails() {
+    let (env, client, _admin) = setup();
+    let owner = Address::generate(&env);
+    client.register(&owner, &String::from_str(&env, "Red Cross"));
+    client.approve_ngo(&owner);
+
+    let result = client.try_unregister(&owner);
+
+    assert_eq!(result, Err(Ok(Error::AlreadyVerified)));
+    // The entry survives the rejected call, verification intact.
+    assert!(client.get_ngo(&owner).verified);
+    assert_eq!(client.list_ngos(&0, &10).len(), 1);
+}
