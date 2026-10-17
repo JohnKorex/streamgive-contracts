@@ -2740,6 +2740,152 @@ fn status_is_queryable_after_cancel_then_further_operations_fail() {
     assert!(result.is_err()); // nothing left to withdraw
 }
 
+#[test]
+fn stream_status_state_machine_walks_each_transition() {
+    #[derive(Clone, Copy)]
+    enum Step {
+        Advance(u64),
+        Withdraw,
+        TopUp(i128),
+        ModifyRate(i128),
+        Cancel,
+        Expect(StreamStatus),
+    }
+
+    use Step::*;
+
+    // The create call is implicit for every case: a fresh stream starts Active.
+    // Top-up deliberately leaves a drained stream at Drained until it is
+    // cancelled or drained again; that is the behaviour covered by issue #298
+    // and pinned here so the state machine has one source of truth.
+    let cases: &[(&str, &[Step])] = &[
+        (
+            "active -> drained -> top-up keeps drained -> cancelled",
+            &[
+                Expect(StreamStatus::Active),
+                Advance(100),
+                Withdraw,
+                Expect(StreamStatus::Drained),
+                TopUp(100),
+                Expect(StreamStatus::Drained),
+                Cancel,
+                Expect(StreamStatus::Cancelled),
+            ],
+        ),
+        (
+            "active -> drained -> cancelled",
+            &[
+                Expect(StreamStatus::Active),
+                Advance(100),
+                Withdraw,
+                Expect(StreamStatus::Drained),
+                Cancel,
+                Expect(StreamStatus::Cancelled),
+            ],
+        ),
+        (
+            "active -> partial withdraw stays active -> cancelled",
+            &[
+                Expect(StreamStatus::Active),
+                Advance(50),
+                Withdraw,
+                Expect(StreamStatus::Active),
+                Cancel,
+                Expect(StreamStatus::Cancelled),
+            ],
+        ),
+        (
+            "rate changes do not revive a drained stream",
+            &[
+                Expect(StreamStatus::Active),
+                Advance(100),
+                Withdraw,
+                Expect(StreamStatus::Drained),
+                ModifyRate(20),
+                Expect(StreamStatus::Drained),
+                Cancel,
+                Expect(StreamStatus::Cancelled),
+            ],
+        ),
+    ];
+
+    for (name, steps) in cases {
+        let s = setup();
+        s.token_admin.mint(&s.donor, &2_000);
+        let stream_id = s
+            .client
+            .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+
+        for &step in *steps {
+            match step {
+                Advance(seconds) => s.env.ledger().with_mut(|l| l.timestamp += seconds),
+                Withdraw => {
+                    s.client.withdraw(&stream_id);
+                }
+                TopUp(amount) => {
+                    s.client.top_up(&stream_id, &amount);
+                }
+                ModifyRate(rate) => {
+                    s.client.modify_rate(&stream_id, &rate);
+                }
+                Cancel => {
+                    s.client.cancel_stream(&stream_id);
+                }
+                Expect(expected) => {
+                    assert_eq!(
+                        s.client.get_stream(&stream_id).status,
+                        expected,
+                        "{name}: unexpected status"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn cancelling_a_drained_stream_makes_it_terminal() {
+    let s = setup();
+    s.token_admin.mint(&s.donor, &1_000);
+    let stream_id = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+
+    s.env.ledger().with_mut(|l| l.timestamp += 100);
+    s.client.withdraw(&stream_id);
+    assert_eq!(
+        s.client.get_stream(&stream_id).status,
+        StreamStatus::Drained
+    );
+
+    // Cancelling a drained stream moves it to Cancelled, not back to Active.
+    assert_eq!(s.client.cancel_stream(&stream_id), 0);
+    assert_eq!(
+        s.client.get_stream(&stream_id).status,
+        StreamStatus::Cancelled
+    );
+
+    // Every stream-mutating path treats the cancelled stream as terminal.
+    s.env.ledger().with_mut(|l| l.timestamp += 10);
+    assert_eq!(
+        s.client.try_withdraw(&stream_id),
+        Err(Ok(Error::NothingToWithdraw))
+    );
+    assert_eq!(
+        s.client.try_top_up(&stream_id, &100),
+        Err(Ok(Error::StreamCancelled))
+    );
+    assert_eq!(
+        s.client.try_modify_rate(&stream_id, &20),
+        Err(Ok(Error::StreamCancelled))
+    );
+    assert_eq!(
+        s.client
+            .try_transfer_stream(&stream_id, &Address::generate(&s.env)),
+        Err(Ok(Error::StreamCancelled))
+    );
+}
+
 // =============================================================================
 // transfer_stream (reassign a stream to a new NGO)
 // =============================================================================

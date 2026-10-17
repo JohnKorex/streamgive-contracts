@@ -3,10 +3,8 @@
 
 use super::*;
 use soroban_sdk::testutils::storage::{Instance as _, Persistent as _};
-use soroban_sdk::testutils::{
-    Address as _, AuthorizedFunction, Events as _, Ledger, MockAuth, MockAuthInvoke,
-};
-use soroban_sdk::{symbol_short, vec, xdr, IntoVal, Symbol, TryFromVal, Val, Vec};
+use soroban_sdk::testutils::{Address as _, AuthorizedFunction, Events as _, Ledger};
+use soroban_sdk::{symbol_short, vec, IntoVal, Symbol, Val, Vec};
 
 fn setup() -> (Env, NgoRegistryClient<'static>, Address) {
     let env = Env::default();
@@ -751,7 +749,7 @@ fn list_ngos_one_ngo() {
 fn list_ngos_across_page_boundaries() {
     let (env, client, _admin) = setup();
     let mut owners = soroban_sdk::vec![&env];
-    for i in 0..5 {
+    for _ in 0..5 {
         let owner = Address::generate(&env);
         let name = String::from_str(&env, "NGO");
         client.register(&owner, &name);

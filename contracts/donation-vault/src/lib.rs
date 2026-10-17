@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 #![no_std]
 use soroban_sdk::{
-    contract, contractclient, contracterror, contractevent, contractimpl, contracttype,
-    symbol_short, token, Address, BytesN, Env, Map, String, Vec,
+    contract, contractclient, contracterror, contractevent, contractimpl, contracttype, token,
+    Address, BytesN, Env, Map, String, Vec,
 };
 
 #[contractevent(topics = ["propadmin"], data_format = "single-value")]
@@ -1760,7 +1760,7 @@ impl DonationVault {
 
         // External token transfer is the last step
         let token_client = token::Client::new(&env, &token);
-        token_client.transfer(&donor, &env.current_contract_address(), &deposit);
+        token_client.transfer(&donor, env.current_contract_address(), &deposit);
 
         CreatedEvent {
             stream_id,
@@ -2244,7 +2244,7 @@ impl DonationVault {
         extend_stream_ttl(&env, stream_id);
 
         // External token transfer is the last step
-        token_client.transfer(&stream.donor, &env.current_contract_address(), &amount);
+        token_client.transfer(&stream.donor, env.current_contract_address(), &amount);
 
         ToppedUpEvent {
             stream_id,
