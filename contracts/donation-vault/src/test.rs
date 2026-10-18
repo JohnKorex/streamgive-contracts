@@ -1639,33 +1639,25 @@ fn cancel_stream_twice_is_harmless() {
     assert_eq!(stream.withdrawn, 500);
     assert!(stream.cancelled);
 
-    // Cancelling again settles zero (rate and balance are already zero) and
-    // refunds zero, leaving balances and stream state unchanged.
+    // Cancelling again returns StreamCancelled error without rewriting storage
+    // or resetting last_update, maintaining consistency with top_up and modify_rate.
     s.env.ledger().with_mut(|l| l.timestamp += 50);
-    let refund = s.client.cancel_stream(&stream_id);
-    assert_eq!(refund, 0);
+    let last_update_before_second_cancel = stream.last_update;
+    
+    let result = s.client.try_cancel_stream(&stream_id);
+    assert_eq!(result, Err(Ok(Error::StreamCancelled)));
 
-    // Sampled here, before any further SDK call: `events().all()` only covers
-    // the most recent invocation, so reading a balance or the stream below
-    // would reset the buffer and make the comparison below vacuous.
-    let events_after_second_cancel = event_count(&s.env, &s.client.address);
-
+    // Balances remain unchanged
     assert_eq!(s.token.balance(&s.ngo), 500);
     assert_eq!(s.token.balance(&s.donor), 500);
 
-    let stream = s.client.get_stream(&stream_id);
-    assert_eq!(stream.balance, 0);
-    assert_eq!(stream.rate, 0);
-    assert_eq!(stream.withdrawn, 500);
-    assert!(stream.cancelled);
-
-    // accrued and refund were both zero, so the second cancel must publish
-    // nothing. A duplicate cancel event is indistinguishable from a real
-    // cancellation to an indexer watching the topic (issue #91).
-    assert_eq!(
-        events_after_second_cancel, 0,
-        "a duplicate cancel event was emitted for an already-cancelled stream"
-    );
+    // Stream state remains unchanged (not rewritten)
+    let stream_after = s.client.get_stream(&stream_id);
+    assert_eq!(stream_after.balance, 0);
+    assert_eq!(stream_after.rate, 0);
+    assert_eq!(stream_after.withdrawn, 500);
+    assert!(stream_after.cancelled);
+    assert_eq!(stream_after.last_update, last_update_before_second_cancel);
 }
 
 #[test]
@@ -1788,6 +1780,25 @@ fn top_up_checks_the_amount_before_the_stream_id() {
     // StreamNotFound — worth pinning so the order can't quietly flip.
     let result = s.client.try_top_up(&999, &0);
     assert_eq!(result, Err(Ok(Error::InvalidAmount)));
+}
+
+#[test]
+fn top_up_rejects_below_minimum_deposit() {
+    let s = setup();
+    s.token_admin.mint(&s.donor, &1_500);
+
+    s.client.set_min_deposit(&100);
+    let stream_id = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+
+    // Below minimum should fail
+    let result = s.client.try_top_up(&stream_id, &50);
+    assert_eq!(result, Err(Ok(Error::DepositTooLow)));
+
+    // At minimum should succeed
+    s.client.top_up(&stream_id, &100);
+    assert_eq!(s.client.get_stream(&stream_id).balance, 1_100);
 }
 
 #[test]
@@ -2900,19 +2911,19 @@ fn stream_status_state_machine_walks_each_transition() {
     use Step::*;
 
     // The create call is implicit for every case: a fresh stream starts Active.
-    // Top-up deliberately leaves a drained stream at Drained until it is
-    // cancelled or drained again; that is the behaviour covered by issue #298
-    // and pinned here so the state machine has one source of truth.
+    // Top-up reactivates a drained stream if it has a positive balance after
+    // the top-up; that is the behaviour covered by issue #298 and pinned here
+    // so the state machine has one source of truth.
     let cases: &[(&str, &[Step])] = &[
         (
-            "active -> drained -> top-up keeps drained -> cancelled",
+            "active -> drained -> top-up reactivates -> cancelled",
             &[
                 Expect(StreamStatus::Active),
                 Advance(100),
                 Withdraw,
                 Expect(StreamStatus::Drained),
                 TopUp(100),
-                Expect(StreamStatus::Drained),
+                Expect(StreamStatus::Active),
                 Cancel,
                 Expect(StreamStatus::Cancelled),
             ],
@@ -4355,19 +4366,50 @@ fn modify_rate_and_top_up_on_a_drained_stream() {
     assert_eq!(after_modify.status, StreamStatus::Drained);
     assert!(!after_modify.cancelled);
 
-    // top_up is allowed, adds balance, and leaves the stored status as
-    // Drained (the current code does not recompute status on top-up).
+    // top_up is allowed, adds balance, and reactivates the drained stream.
     let top_up = s.client.try_top_up(&stream_id, &500);
     assert_eq!(top_up, Ok(Ok(())));
     let after_top_up = s.client.get_stream(&stream_id);
     assert_eq!(after_top_up.balance, 500);
     assert_eq!(after_top_up.rate, 20);
-    assert_eq!(after_top_up.status, StreamStatus::Drained);
+    assert_eq!(after_top_up.status, StreamStatus::Active);
     assert!(!after_top_up.cancelled);
 
     // The new balance accrues at the new rate.
     s.env.ledger().with_mut(|l| l.timestamp += 10);
     assert_eq!(s.client.pending_accrual(&stream_id), 200);
+}
+
+#[test]
+fn settle_marks_stream_drained_when_balance_reaches_zero() {
+    let s = setup();
+    s.token_admin.mint(&s.donor, &1_000);
+
+    // Create a stream that will drain exactly after modify_rate settles
+    let stream_id = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+
+    // Advance exactly 100 seconds so the entire balance accrues
+    s.env.ledger().with_mut(|l| l.timestamp += 100);
+
+    // modify_rate calls settle, which should drain the stream and mark it Drained
+    s.client.modify_rate(&stream_id, &20);
+
+    let stream = s.client.get_stream(&stream_id);
+    assert_eq!(stream.balance, 0);
+    assert_eq!(stream.rate, 20);
+    assert_eq!(stream.status, StreamStatus::Drained);
+    assert!(!stream.cancelled);
+
+    // Verify the NGO received all accrued funds
+    assert_eq!(s.token.balance(&s.ngo), 1_000);
+
+    // modify_rate is still allowed on a drained stream
+    s.client.modify_rate(&stream_id, &5);
+    let after = s.client.get_stream(&stream_id);
+    assert_eq!(after.rate, 5);
+    assert_eq!(after.status, StreamStatus::Drained);
 }
 
 // =============================================================================

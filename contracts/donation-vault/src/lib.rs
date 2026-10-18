@@ -550,6 +550,11 @@ fn settle(env: &Env, stream: &mut Stream, now: u64) -> Result<i128, Error> {
     }
     stream.last_update = now;
 
+    // Mark as Drained if settle emptied the balance
+    if stream.balance == 0 && stream.status == StreamStatus::Active {
+        stream.status = StreamStatus::Drained;
+    }
+
     // External token transfer is the last step
     if accrued > 0 {
         let token_client = token::Client::new(env, &stream.token);
@@ -2236,6 +2241,11 @@ impl DonationVault {
 
         stream.donor.require_auth();
 
+        // Return early if the stream is already cancelled to avoid rewriting storage
+        if stream.cancelled {
+            return Err(Error::StreamCancelled);
+        }
+
         let now = env.ledger().timestamp();
         let accrued = settle(&env, &mut stream, now)?;
 
@@ -2407,6 +2417,9 @@ impl DonationVault {
         if amount <= 0 {
             return Err(Error::InvalidAmount);
         }
+        if amount < Self::min_deposit(env.clone()) {
+            return Err(Error::DepositTooLow);
+        }
 
         let key = DataKey::Stream(stream_id);
         let mut stream: Stream = env
@@ -2431,6 +2444,12 @@ impl DonationVault {
             .balance
             .checked_add(amount)
             .ok_or(Error::ArithmeticOverflow)?;
+        
+        // Reactivate a drained stream if it now has a positive balance
+        if stream.status == StreamStatus::Drained && stream.balance > 0 {
+            stream.status = StreamStatus::Active;
+        }
+        
         let total_donated: i128 = env
             .storage()
             .instance()
