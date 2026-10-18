@@ -8,7 +8,7 @@ use soroban_sdk::testutils::{
 };
 use soroban_sdk::token::{Client as TokenClient, StellarAssetClient};
 use soroban_sdk::xdr::{ContractEventBody, ScVal, ScVec};
-use soroban_sdk::{symbol_short, IntoVal, Symbol, TryFromVal, Val, Vec};
+use soroban_sdk::{symbol_short, Bytes, IntoVal, Symbol, TryFromVal, Val, Vec};
 
 /// Asserts that the most recently published event has the given topics and
 /// data, regardless of which contract emitted it — vault entry points always
@@ -3994,4 +3994,86 @@ fn modify_rate_and_top_up_on_a_drained_stream() {
     // The new balance accrues at the new rate.
     s.env.ledger().with_mut(|l| l.timestamp += 10);
     assert_eq!(s.client.pending_accrual(&stream_id), 200);
+}
+
+// =============================================================================
+// configuration events (issue #277)
+// =============================================================================
+
+#[test]
+fn init_publishes_init_event() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let contract_id = env.register(DonationVault, ());
+    let client = DonationVaultClient::new(&env, &contract_id);
+
+    client.init(&admin);
+
+    assert_last_event(&env, (symbol_short!("init"),), admin.clone());
+}
+
+#[test]
+fn constructor_publishes_init_event() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+
+    env.register(DonationVault, DonationVaultArgs::__constructor(&admin));
+
+    assert_last_event(&env, (symbol_short!("init"),), admin.clone());
+}
+
+#[test]
+fn clear_treasury_publishes_event() {
+    let s = setup();
+    s.client.set_treasury(&Address::generate(&s.env));
+
+    s.client.clear_treasury();
+
+    assert_last_event(&s.env, (symbol_short!("treclr"),), ());
+}
+
+#[test]
+fn set_min_deposit_publishes_event() {
+    let s = setup();
+
+    s.client.set_min_deposit(&100);
+
+    assert_last_event(&s.env, (symbol_short!("mindep"),), 100i128);
+}
+
+#[test]
+fn set_cancel_grace_ledgers_publishes_event() {
+    let s = setup();
+
+    s.client.set_cancel_grace_ledgers(&25);
+
+    assert_last_event(&s.env, (symbol_short!("grceset"),), 25u32);
+}
+
+#[test]
+fn set_registry_publishes_event() {
+    let s = setup();
+    let registry = Address::generate(&s.env);
+
+    s.client.set_registry(&registry);
+
+    assert_last_event(&s.env, (symbol_short!("regset"),), registry.clone());
+}
+
+#[test]
+fn upgrade_publishes_event() {
+    let s = setup();
+    // Upload any bytes so the upgrade target exists; the host only checks that
+    // the hash is present, not that it is executable.
+    let new_wasm_hash = s.env.deployer().upload_contract_wasm(Bytes::new(&s.env));
+
+    s.client.upgrade(&new_wasm_hash);
+
+    assert_last_event(
+        &s.env,
+        (symbol_short!("upgrade"),),
+        new_wasm_hash.clone(),
+    );
 }

@@ -7,21 +7,22 @@ going to `streamgisve-docs` first.
 Soroban events have two parts:
 
 - **Topics** — a tuple, always starting with a `Symbol` naming the event.
+  Topics are indexed/filterable.
+- **Data** — the event payload. Shown below as the Rust type(s) passed to
+  `env.events().publish((topics...), data)`. A single value publishes as
+  itself; a tuple of values publishes as an XDR array in that order.
+
 The contracts define migrated event declarations with Soroban SDK's
 `#[contractevent]` macro. Explicit topic names and data formats keep the wire
 layout stable. Event type names include `RegisterEvent`, `RenamedEvent`,
-`ApprovedEvent`, `RevokedEvent`, `UnregisteredEvent`, `ProposedAdminEvent`,
-`AcceptedAdminEvent`, `CancelledAdminEvent`, `PausedEvent`, `UnpausedEvent`,
-`TreasurySetEvent`, `FeeBpsSetEvent`, `TokenFeeBpsSetEvent`,
-`TokenFeeBpsClearedEvent`, `MaxStreamsPerDonorSetEvent`, `CreatedEvent`,
-`WithdrawnEvent`, `CancelledStreamEvent`, `RescuedStreamEvent`, `ToppedUpEvent`,
-and `RateModifiedEvent`.
-
-- **Topics** â€” a tuple, always starting with a `Symbol` naming the event.
-  Topics are indexed/filterable.
-- -- **Data** — the event payload. Shown below as the Rust type(s) passed to
-  `env.events().publish((topics...), data)`. A single value publishes as
-  itself; a tuple of values publishes as an XDR array in that order.
+`ApprovedEvent`, `RevokedEvent`, `UnregisteredEvent`, `RemovedEvent`,
+`ProposedAdminEvent`, `AcceptedAdminEvent`, `CancelledAdminEvent`,
+`PausedEvent`, `UnpausedEvent`, `TreasurySetEvent`, `TreasuryClearedEvent`,
+`FeeBpsSetEvent`, `TokenFeeBpsSetEvent`, `TokenFeeBpsClearedEvent`,
+`MinDepositSetEvent`, `CancelGraceLedgersSetEvent`, `RegistrySetEvent`,
+`MaxStreamsPerDonorSetEvent`, `InitializedEvent`, `UpgradedEvent`,
+`CreatedEvent`, `WithdrawnEvent`, `CancelledStreamEvent`, `RescuedStreamEvent`,
+`ToppedUpEvent`, and `RateModifiedEvent`.
 
 `Address`, `i128`, `u64`, `u32`, `bool`, and `String` are the standard
 Soroban SDK/XDR types (`Address` is the SDK's account/contract address
@@ -75,7 +76,50 @@ event as cancelling the most recent `approved` event for that address.
 | Topics | `("revoked", ngo_owner: Address)` |
 | Data | `()` (no payload) |
 
+### `removed`
+
+Emitted by `remove_ngo` when an admin deletes an unverified application
+outright, without waiting for its owner to `unregister`. Like `unregist` this
+is the owner-initiated counterpart, but admin-initiated and carrying the same
+payload. A verified NGO cannot be removed directly: it must be revoked first,
+so a `removed` event never follows an un-revoked `approved` for the same
+`owner`.
+
+| | |
+|---|---|
+| Topics | `("removed", owner: Address)` |
+| Data | `()` (no payload) |
+
+### `init`
+
+Emitted by the registry constructor and by `init` when the admin is first set,
+so an indexer can learn the contract's admin from deployment events alone.
+
+| | |
+|---|---|
+| Topics | `("init",)` |
+| Data | `admin: Address` |
+
+### `upgrade`
+
+Emitted by `upgrade` when an admin replaces the registry's Wasm bytecode.
+
+| | |
+|---|---|
+| Topics | `("upgrade",)` |
+| Data | `new_wasm_hash: BytesN<32>` |
+
 ## `donation-vault`
+
+### `init`
+
+Emitted by the vault constructor and by `init` when the admin is first set, so
+an indexer can learn the contract's admin from deployment events alone.
+
+| | |
+|---|---|
+| Topics | `("init",)` |
+| Data | `admin: Address` |
 
 ### `propadmin`
 
@@ -171,6 +215,66 @@ The event carries the new treasury address so an off-chain indexer can track
 where protocol fees will flow without polling `treasury()`. Protocol fees only
 affect payouts once a treasury is configured, so pair this with `feeset`/`fee_bps()`
 when deriving an actual split.
+
+### `treclr`
+
+Emitted by `clear_treasury` when an admin removes the configured treasury.
+
+| | |
+|---|---|
+| Topics | `("treclr",)` |
+| Data | `()` (no payload) |
+
+Clearing the treasury is rejected while a non-zero `fee_bps` is set, so a
+`treclr` event never follows a `feeset` with a non-zero value without an
+intervening `feeset` of `0`. After a `treclr` event, protocol fees stop
+accruing until a new `treasset` event appears.
+
+### `mindep`
+
+Emitted by `set_min_deposit` when an admin changes the minimum stream deposit.
+
+| | |
+|---|---|
+| Topics | `("mindep",)` |
+| Data | `min_deposit: i128` (the new minimum) |
+
+The event carries the full new value so an indexer can track the minimum
+without polling `min_deposit()`. A negative value fails with `InvalidAmount`
+and emits nothing.
+
+### `grceset`
+
+Emitted by `set_cancel_grace_ledgers` when an admin changes the extra ledger
+retention window applied to cancelled stream records.
+
+| | |
+|---|---|
+| Topics | `("grceset",)` |
+| Data | `grace_ledgers: u32` (the new window, in ledgers) |
+
+### `regset`
+
+Emitted by `set_registry` when an admin points the vault at an NGO registry
+contract.
+
+| | |
+|---|---|
+| Topics | `("regset",)` |
+| Data | `registry: Address` (the new registry address) |
+
+Once set, `create_stream` verifies the NGO against this registry; there is no
+entry point that clears the registry back to `None`, so this event only ever
+moves the vault to a new registry address.
+
+### `upgrade`
+
+Emitted by `upgrade` when an admin replaces the vault's Wasm bytecode.
+
+| | |
+|---|---|
+| Topics | `("upgrade",)` |
+| Data | `new_wasm_hash: BytesN<32>` |
 
 ### `created`
 

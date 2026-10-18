@@ -3,17 +3,44 @@
 # with the deploying identity as admin, and writes the resulting contract
 # IDs to deployments.json at the repo root.
 #
-# Requires the `stellar` CLI (https://developers.stellar.org/docs/tools/cli)
-# and a funded testnet identity. Run from the repo root:
+# Requires the `stellar` CLI (https://developers.stellar.org/docs/tools/cli),
+# `node` (to update deployments.json), and a funded testnet identity. Run
+# from the repo root:
 #
 #   STELLAR_SOURCE_ACCOUNT=my-testnet-identity ./scripts/deploy-testnet.sh
+#
+# Like deploy-mainnet.sh, this refuses to overwrite an existing testnet entry:
+# a re-run deploys fresh contracts and orphans the recorded ones. Pass
+# --force to overwrite it deliberately.
 
 set -euo pipefail
 
 NETWORK="testnet"
+TESTNET_PASSPHRASE="Test SDF Network ; September 2015"
 SOURCE_ACCOUNT="${STELLAR_SOURCE_ACCOUNT:?Set STELLAR_SOURCE_ACCOUNT to a funded testnet identity name}"
 WASM_DIR="target/wasm32v1-none/release"
 DEPLOYMENTS_FILE="deployments.json"
+
+usage() {
+  echo "Usage: $0 [--force]" >&2
+  echo "  --force   overwrite an existing testnet entry in $DEPLOYMENTS_FILE" >&2
+}
+
+FORCE=0
+for arg in "$@"; do
+  case "$arg" in
+    --force) FORCE=1 ;;
+    -h | --help)
+      usage
+      exit 0
+      ;;
+    *)
+      echo "Error: unknown argument '$arg'." >&2
+      usage
+      exit 1
+      ;;
+  esac
+done
 
 # Fail fast, before anything is built or deployed, if the tools this script
 # depends on aren't there — otherwise a missing target can be discovered
@@ -23,6 +50,11 @@ check_prerequisites() {
   if ! command -v stellar >/dev/null 2>&1; then
     echo "Error: the 'stellar' CLI is not installed or not on PATH." >&2
     echo "See https://developers.stellar.org/docs/tools/cli for install instructions." >&2
+    exit 1
+  fi
+
+  if ! command -v node >/dev/null 2>&1; then
+    echo "Error: 'node' is not installed or not on PATH; it is needed to update $DEPLOYMENTS_FILE." >&2
     exit 1
   fi
 
@@ -38,7 +70,42 @@ check_prerequisites() {
   fi
 }
 
+# Never clobber a recorded testnet deployment: re-running would deploy fresh
+# contracts and orphan the ones users may already be using. Unlike the
+# "mainnet" entry, which deploy-mainnet.sh nests under a key, the testnet
+# entry lives at the top level of the file, so its presence is marked by a
+# top-level "contracts" object.
+check_no_existing_deployment() {
+  [ -f "$DEPLOYMENTS_FILE" ] || return 0
+
+  local status=0
+  DEPLOYMENTS_FILE="$DEPLOYMENTS_FILE" node -e '
+    const fs = require("fs");
+    let data;
+    try {
+      data = JSON.parse(fs.readFileSync(process.env.DEPLOYMENTS_FILE, "utf8"));
+    } catch (e) {
+      console.error("Error: could not parse " + process.env.DEPLOYMENTS_FILE + ": " + e.message);
+      process.exit(2);
+    }
+    process.exit(data.contracts ? 1 : 0);
+  ' || status=$?
+
+  if [ "$status" -eq 1 ]; then
+    if [ "$FORCE" -eq 1 ]; then
+      echo "Warning: overwriting the existing testnet entry in $DEPLOYMENTS_FILE (--force)." >&2
+    else
+      echo "Error: $DEPLOYMENTS_FILE already has a testnet entry; refusing to overwrite it." >&2
+      echo "If you really mean to redeploy, remove that entry by hand first, or pass --force." >&2
+      exit 1
+    fi
+  elif [ "$status" -ne 0 ]; then
+    exit 1
+  fi
+}
+
 check_prerequisites
+check_no_existing_deployment
 
 # The admin is deliberately separate from the account paying the deploy
 # fees. The admin must be a wallet a human can actually sign with, since
@@ -109,6 +176,21 @@ validate_config_inputs
 
 echo "Building contracts (release, wasm32v1-none)..."
 cargo build --workspace --target wasm32v1-none --release
+
+# A contract's wasm hash is sha256 of its built Wasm — the same value the
+# network keys the uploaded code by. Recording it in deployments.json lets a
+# consumer confirm the deployed bytecode matches a reviewed build.
+compute_wasm_hash() {
+  local wasm_path="$1"
+  if [ ! -f "$wasm_path" ]; then
+    echo "Error: expected Wasm at $wasm_path after the build." >&2
+    exit 1
+  fi
+  WASM_PATH="$wasm_path" node -e 'process.stdout.write(require("crypto").createHash("sha256").update(require("fs").readFileSync(process.env.WASM_PATH)).digest("hex"))'
+}
+
+NGO_REGISTRY_WASM_HASH=$(compute_wasm_hash "$WASM_DIR/ngo_registry.wasm")
+DONATION_VAULT_WASM_HASH=$(compute_wasm_hash "$WASM_DIR/donation_vault.wasm")
 
 deploy_contract() {
   local wasm_name="$1"
@@ -189,34 +271,45 @@ echo "$CONFIG_RAW"
 echo "======================================================================"
 
 # deploy-mainnet.sh records its deployment under a "mainnet" key in this same
-# file; rewriting the file must not lose it, so carry it over if present.
-MAINNET_ENTRY=""
-if [ -f "$DEPLOYMENTS_FILE" ] && command -v node >/dev/null 2>&1; then
-  MAINNET_ENTRY=$(DEPLOYMENTS_FILE="$DEPLOYMENTS_FILE" node -e '
-    const data = JSON.parse(require("fs").readFileSync(process.env.DEPLOYMENTS_FILE, "utf8"));
-    if (data.mainnet) process.stdout.write(JSON.stringify(data.mainnet));
-  ')
-fi
+# file; rewriting the file must not lose it, so carry it over. The entry is
+# given the same field set as the "mainnet" one (network_passphrase and the
+# wasm hashes) so an indexer can read either without special-casing, and the
+# write is validated and renamed into place so a failure can't truncate the
+# file.
+trap 'rm -f "$DEPLOYMENTS_FILE.tmp"' EXIT
 
-cat > "$DEPLOYMENTS_FILE" <<EOF
-{
-  "network": "$NETWORK",
-  "deployed_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
-  "admin": "$ADMIN_ADDRESS",
-  "contracts": {
-    "ngo-registry": "$NGO_REGISTRY_ID",
-    "donation-vault": "$DONATION_VAULT_ID"
-  }
-}
-EOF
-
-if [ -n "$MAINNET_ENTRY" ]; then
-  DEPLOYMENTS_FILE="$DEPLOYMENTS_FILE" MAINNET_ENTRY="$MAINNET_ENTRY" node -e '
+DEPLOYMENTS_FILE="$DEPLOYMENTS_FILE" \
+NETWORK="$NETWORK" \
+DEPLOYED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+ADMIN_ADDRESS="$ADMIN_ADDRESS" \
+NETWORK_PASSPHRASE="$TESTNET_PASSPHRASE" \
+NGO_REGISTRY_ID="$NGO_REGISTRY_ID" \
+DONATION_VAULT_ID="$DONATION_VAULT_ID" \
+NGO_REGISTRY_WASM_HASH="$NGO_REGISTRY_WASM_HASH" \
+DONATION_VAULT_WASM_HASH="$DONATION_VAULT_WASM_HASH" \
+  node -e '
     const fs = require("fs");
-    const data = JSON.parse(fs.readFileSync(process.env.DEPLOYMENTS_FILE, "utf8"));
-    data.mainnet = JSON.parse(process.env.MAINNET_ENTRY);
-    fs.writeFileSync(process.env.DEPLOYMENTS_FILE, JSON.stringify(data, null, 2) + "\n");
+    const file = process.env.DEPLOYMENTS_FILE;
+    const existing = fs.existsSync(file) ? JSON.parse(fs.readFileSync(file, "utf8")) : {};
+    const entry = {
+      network: process.env.NETWORK,
+      network_passphrase: process.env.NETWORK_PASSPHRASE,
+      deployed_at: process.env.DEPLOYED_AT,
+      admin: process.env.ADMIN_ADDRESS,
+      contracts: {
+        "ngo-registry": process.env.NGO_REGISTRY_ID,
+        "donation-vault": process.env.DONATION_VAULT_ID,
+      },
+      wasm_hashes: {
+        "ngo-registry": process.env.NGO_REGISTRY_WASM_HASH,
+        "donation-vault": process.env.DONATION_VAULT_WASM_HASH,
+      },
+    };
+    if (existing.mainnet) entry.mainnet = existing.mainnet;
+    const tmp = file + ".tmp";
+    fs.writeFileSync(tmp, JSON.stringify(entry, null, 2) + "\n");
+    JSON.parse(fs.readFileSync(tmp, "utf8"));
+    fs.renameSync(tmp, file);
   '
-fi
 
 echo "Wrote $DEPLOYMENTS_FILE"

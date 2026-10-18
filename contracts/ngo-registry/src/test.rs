@@ -47,6 +47,52 @@ fn init_without_admin_auth_fails() {
 }
 
 #[test]
+fn init_publishes_init_event() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let contract_id = env.register(NgoRegistry, ());
+    let client = NgoRegistryClient::new(&env, &contract_id);
+
+    client.init(&admin);
+
+    assert_eq!(
+        env.events().all(),
+        vec![
+            &env,
+            (
+                contract_id.clone(),
+                (symbol_short!("init"),).into_val(&env),
+                admin.into_val(&env),
+            ),
+        ]
+    );
+}
+
+#[test]
+fn constructor_publishes_init_event() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+
+    // The constructor is the latest top-level invocation, so its event is the
+    // only contract event in the buffer.
+    let contract_id = env.register(NgoRegistry, NgoRegistryArgs::__constructor(&admin));
+
+    assert_eq!(
+        env.events().all(),
+        vec![
+            &env,
+            (
+                contract_id.clone(),
+                (symbol_short!("init"),).into_val(&env),
+                admin.into_val(&env),
+            ),
+        ]
+    );
+}
+
+#[test]
 fn register_ngo_stores_unverified_entry() {
     let (env, client, _admin) = setup();
     let owner = Address::generate(&env);
@@ -220,6 +266,124 @@ fn approve_unregistered_ngo_fails() {
 
     let result = client.try_approve_ngo(&random);
     assert_eq!(result, Err(Ok(Error::NotRegistered)));
+}
+
+// =============================================================================
+// batch_approve (issue #275)
+// =============================================================================
+
+#[test]
+fn batch_approve_approves_each_ngo_and_publishes_events() {
+    let (env, client, _admin) = setup();
+    let a = Address::generate(&env);
+    let b = Address::generate(&env);
+    let c = Address::generate(&env);
+    client.register(&a, &String::from_str(&env, "Red Cross"));
+    client.register(&b, &String::from_str(&env, "Oxfam"));
+    client.register(&c, &String::from_str(&env, "Save the Children"));
+
+    client.batch_approve(&vec![&env, a.clone(), b.clone(), c.clone()]);
+
+    assert!(client.get_ngo(&a).verified);
+    assert!(client.get_ngo(&b).verified);
+    assert!(client.get_ngo(&c).verified);
+
+    // One `approved` event per NGO, in batch order.
+    assert_eq!(
+        env.events().all(),
+        vec![
+            &env,
+            (
+                client.address.clone(),
+                (symbol_short!("approved"), a).into_val(&env),
+                ().into_val(&env),
+            ),
+            (
+                client.address.clone(),
+                (symbol_short!("approved"), b).into_val(&env),
+                ().into_val(&env),
+            ),
+            (
+                client.address.clone(),
+                (symbol_short!("approved"), c).into_val(&env),
+                ().into_val(&env),
+            ),
+        ]
+    );
+}
+
+#[test]
+fn batch_approve_reverts_atomically_on_unregistered_ngo() {
+    let (env, client, _admin) = setup();
+    let registered = Address::generate(&env);
+    let unknown = Address::generate(&env);
+    client.register(&registered, &String::from_str(&env, "Red Cross"));
+
+    let result = client.try_batch_approve(&vec![&env, registered.clone(), unknown]);
+
+    assert_eq!(result, Err(Ok(Error::NotRegistered)));
+    // The whole batch rolls back: the registered NGO is still pending.
+    assert!(!client.get_ngo(&registered).verified);
+}
+
+#[test]
+fn batch_approve_reverts_atomically_on_already_verified_ngo() {
+    let (env, client, _admin) = setup();
+    let verified = Address::generate(&env);
+    let pending = Address::generate(&env);
+    client.register(&verified, &String::from_str(&env, "Red Cross"));
+    client.register(&pending, &String::from_str(&env, "Oxfam"));
+    client.approve_ngo(&verified);
+
+    let result = client.try_batch_approve(&vec![&env, pending.clone(), verified.clone()]);
+
+    assert_eq!(result, Err(Ok(Error::AlreadyVerified)));
+    assert!(!client.get_ngo(&pending).verified);
+    assert!(client.get_ngo(&verified).verified);
+}
+
+#[test]
+fn batch_approve_rejects_a_duplicate_owner() {
+    let (env, client, _admin) = setup();
+    let owner = Address::generate(&env);
+    client.register(&owner, &String::from_str(&env, "Red Cross"));
+
+    let result = client.try_batch_approve(&vec![&env, owner.clone(), owner.clone()]);
+
+    assert_eq!(result, Err(Ok(Error::AlreadyVerified)));
+    assert!(!client.get_ngo(&owner).verified);
+}
+
+#[test]
+fn batch_approve_empty_batch_is_a_noop() {
+    let (env, client, _admin) = setup();
+    let empty: Vec<Address> = Vec::new(&env);
+
+    assert_eq!(client.try_batch_approve(&empty), Ok(Ok(())));
+    assert_eq!(env.events().all().events().len(), 0);
+}
+
+#[test]
+fn batch_approve_bumps_instance_and_ngo_ttl() {
+    let (env, client, _admin) = setup();
+    let owner = Address::generate(&env);
+    client.register(&owner, &String::from_str(&env, "Red Cross"));
+    age_past_thresholds(&env, &client, &owner);
+
+    client.batch_approve(&vec![&env, owner.clone()]);
+
+    assert_ttls_bumped(&env, &client, &owner);
+}
+
+#[test]
+#[should_panic]
+fn batch_approve_without_admin_auth_fails() {
+    let (env, client, _admin) = setup();
+    let owner = Address::generate(&env);
+    client.register(&owner, &String::from_str(&env, "Red Cross"));
+
+    env.mock_auths(&[]);
+    client.batch_approve(&vec![&env, owner]);
 }
 
 #[test]
@@ -723,6 +887,29 @@ fn upgrade_preserves_state() {
     assert_eq!(ngo_before.verified, ngo_after.verified);
     assert_eq!(client.ngo_count(), 1);
 }
+
+#[test]
+fn upgrade_publishes_event() {
+    let (env, client, _admin) = setup();
+    // Upload any bytes so the upgrade target exists; the host only checks
+    // that the hash is present, not that it is executable.
+    let new_wasm_hash = env.deployer().upload_contract_wasm(Bytes::new(&env));
+
+    client.upgrade(&new_wasm_hash);
+
+    assert_eq!(
+        env.events().all(),
+        vec![
+            &env,
+            (
+                client.address.clone(),
+                (symbol_short!("upgrade"),).into_val(&env),
+                new_wasm_hash.into_val(&env),
+            ),
+        ]
+    );
+}
+
 // list_ngos pagination tests (issue #283)
 // =============================================================================
 
@@ -976,4 +1163,131 @@ fn unregister_verified_ngo_fails() {
     // The entry survives the rejected call, verification intact.
     assert!(client.get_ngo(&owner).verified);
     assert_eq!(client.list_ngos(&0, &10).len(), 1);
+}
+
+// =============================================================================
+// remove_ngo (issue #282)
+// =============================================================================
+
+#[test]
+fn remove_ngo_deletes_unverified_entry() {
+    let (env, client, _admin) = setup();
+    let owner = Address::generate(&env);
+    client.register(&owner, &String::from_str(&env, "Red Cross"));
+    assert_eq!(client.total_ngos(), 1);
+
+    client.remove_ngo(&owner);
+
+    assert_eq!(client.try_get_ngo(&owner), Err(Ok(Error::NotRegistered)));
+    assert!(!client.is_verified(&owner));
+    assert_eq!(client.total_ngos(), 0);
+    assert_eq!(client.list_ngos(&0, &10).len(), 0);
+}
+
+#[test]
+fn remove_ngo_publishes_event() {
+    let (env, client, _admin) = setup();
+    let owner = Address::generate(&env);
+    client.register(&owner, &String::from_str(&env, "Red Cross"));
+
+    client.remove_ngo(&owner);
+
+    // Events are cleared per top-level call; only the removed event is visible.
+    assert_eq!(
+        env.events().all(),
+        vec![
+            &env,
+            (
+                client.address.clone(),
+                (symbol_short!("removed"), owner).into_val(&env),
+                ().into_val(&env),
+            ),
+        ]
+    );
+}
+
+#[test]
+fn remove_ngo_rejects_a_verified_ngo() {
+    let (env, client, _admin) = setup();
+    let owner = Address::generate(&env);
+    client.register(&owner, &String::from_str(&env, "Red Cross"));
+    client.approve_ngo(&owner);
+
+    let result = client.try_remove_ngo(&owner);
+
+    assert_eq!(result, Err(Ok(Error::AlreadyVerified)));
+    // Still there, still verified: revoke_ngo is the way to undo an approval.
+    assert!(client.get_ngo(&owner).verified);
+    assert_eq!(client.total_ngos(), 1);
+}
+
+#[test]
+fn remove_ngo_after_revocation_succeeds() {
+    let (env, client, _admin) = setup();
+    let owner = Address::generate(&env);
+    client.register(&owner, &String::from_str(&env, "Red Cross"));
+    client.approve_ngo(&owner);
+    client.revoke_ngo(&owner);
+
+    client.remove_ngo(&owner);
+
+    assert_eq!(client.try_get_ngo(&owner), Err(Ok(Error::NotRegistered)));
+    assert_eq!(client.total_ngos(), 0);
+}
+
+#[test]
+fn remove_ngo_unknown_owner_fails() {
+    let (env, client, _admin) = setup();
+    let unknown = Address::generate(&env);
+
+    let result = client.try_remove_ngo(&unknown);
+
+    assert_eq!(result, Err(Ok(Error::NotRegistered)));
+}
+
+#[test]
+fn remove_ngo_requires_admin_auth() {
+    let (env, client, admin) = setup();
+    let owner = Address::generate(&env);
+    client.register(&owner, &String::from_str(&env, "Red Cross"));
+
+    client.remove_ngo(&owner);
+
+    assert_sole_auth(&env, &client, &admin, "remove_ngo");
+}
+
+#[test]
+#[should_panic]
+fn remove_ngo_without_admin_auth_fails() {
+    let (env, client, _admin) = setup();
+    let owner = Address::generate(&env);
+    client.register(&owner, &String::from_str(&env, "Red Cross"));
+
+    env.mock_auths(&[]);
+    client.remove_ngo(&owner);
+}
+
+#[test]
+fn remove_ngo_frees_the_index_and_lets_the_owner_register_again() {
+    let (env, client, _admin) = setup();
+    let a = Address::generate(&env);
+    let b = Address::generate(&env);
+    let c = Address::generate(&env);
+    client.register(&a, &String::from_str(&env, "A"));
+    client.register(&b, &String::from_str(&env, "B"));
+    client.register(&c, &String::from_str(&env, "C"));
+
+    // Removing the middle entry swaps the last one into its slot.
+    client.remove_ngo(&b);
+
+    let owners = client.list_ngos(&0, &10);
+    assert_eq!(owners.len(), 2);
+    assert_eq!(owners.get(0).unwrap(), a);
+    assert_eq!(owners.get(1).unwrap(), c);
+    assert_eq!(client.total_ngos(), 2);
+
+    // The freed owner can apply again from scratch.
+    client.register(&b, &String::from_str(&env, "B again"));
+    assert!(!client.get_ngo(&b).verified);
+    assert_eq!(client.total_ngos(), 3);
 }

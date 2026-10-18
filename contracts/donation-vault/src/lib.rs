@@ -125,6 +125,36 @@ pub struct RescuedStreamEvent {
     pub refund: i128,
 }
 
+#[contractevent(topics = ["treclr"], data_format = "single-value")]
+pub struct TreasuryClearedEvent {
+    pub data: (),
+}
+
+#[contractevent(topics = ["mindep"], data_format = "single-value")]
+pub struct MinDepositSetEvent {
+    pub min_deposit: i128,
+}
+
+#[contractevent(topics = ["grceset"], data_format = "single-value")]
+pub struct CancelGraceLedgersSetEvent {
+    pub grace_ledgers: u32,
+}
+
+#[contractevent(topics = ["regset"], data_format = "single-value")]
+pub struct RegistrySetEvent {
+    pub registry: Address,
+}
+
+#[contractevent(topics = ["init"], data_format = "single-value")]
+pub struct InitializedEvent {
+    pub admin: Address,
+}
+
+#[contractevent(topics = ["upgrade"], data_format = "single-value")]
+pub struct UpgradedEvent {
+    pub new_wasm_hash: BytesN<32>,
+}
+
 mod math;
 
 /// Mirrors ngo-registry's `Ngo` record for cross-contract calls. Declared
@@ -527,6 +557,7 @@ impl DonationVault {
             .instance()
             .set(&DataKey::CancelGraceLedgers, &0u32);
         extend_instance_ttl(&env);
+        InitializedEvent { admin }.publish(&env);
     }
 
     /// Sets the vault admin and seeds the stream-id counter. Can only be called once.
@@ -560,6 +591,7 @@ impl DonationVault {
             .instance()
             .set(&DataKey::CancelGraceLedgers, &0u32);
         extend_instance_ttl(&env);
+        InitializedEvent { admin }.publish(&env);
         Ok(())
     }
 
@@ -1247,6 +1279,9 @@ impl DonationVault {
         }
         env.storage().instance().remove(&DataKey::Treasury);
         extend_instance_ttl(&env);
+
+        TreasuryClearedEvent { data: () }.publish(&env);
+
         Ok(())
     }
 
@@ -1478,6 +1513,9 @@ impl DonationVault {
             .instance()
             .set(&DataKey::MinDeposit, &min_deposit);
         extend_instance_ttl(&env);
+
+        MinDepositSetEvent { min_deposit }.publish(&env);
+
         Ok(())
     }
 
@@ -1516,6 +1554,9 @@ impl DonationVault {
             .instance()
             .set(&DataKey::CancelGraceLedgers, &grace_ledgers);
         extend_instance_ttl(&env);
+
+        CancelGraceLedgersSetEvent { grace_ledgers }.publish(&env);
+
         Ok(())
     }
 
@@ -1598,6 +1639,9 @@ impl DonationVault {
         require_admin(&env)?;
         env.storage().instance().set(&DataKey::Registry, &registry);
         extend_instance_ttl(&env);
+
+        RegistrySetEvent { registry }.publish(&env);
+
         Ok(())
     }
 
@@ -2389,7 +2433,9 @@ impl DonationVault {
     /// ```
     pub fn upgrade(env: Env, new_wasm_hash: BytesN<32>) -> Result<(), Error> {
         require_admin(&env)?;
-        env.deployer().update_current_contract_wasm(new_wasm_hash);
+        env.deployer()
+            .update_current_contract_wasm(new_wasm_hash.clone());
+        UpgradedEvent { new_wasm_hash }.publish(&env);
         Ok(())
     }
 }
