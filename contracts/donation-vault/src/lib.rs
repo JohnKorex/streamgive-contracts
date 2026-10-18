@@ -2043,6 +2043,7 @@ impl DonationVault {
         let now = env.ledger().timestamp();
         let mut ngo: Option<Address> = None;
         let mut net_amounts: Vec<i128> = Vec::new(&env);
+        let mut accrued_amounts: Vec<i128> = Vec::new(&env);
         let mut net_payouts: Map<Address, i128> = Map::new(&env);
         let mut fee_payouts: Map<Address, i128> = Map::new(&env);
 
@@ -2070,6 +2071,7 @@ impl DonationVault {
 
             let elapsed = now.saturating_sub(stream.last_update);
             let accrued = math::accrued(stream.rate, elapsed, stream.balance);
+            accrued_amounts.push_back(accrued);
             
             let fee = if accrued > 0 {
                 compute_fee(&env, &stream.token, accrued)
@@ -2136,36 +2138,19 @@ impl DonationVault {
         // topics and data so the indexer needs no batch-specific handling.
         let mut idx = 0;
         for stream_id in stream_ids.iter() {
+            let accrued = accrued_amounts.get(idx).unwrap_or(0);
             let net = net_amounts.get(idx).unwrap_or(0);
             idx += 1;
             
-            if net > 0 {
-                let stream_key = DataKey::Stream(stream_id);
-                if let Some(st) = env
-                    .storage()
-                    .persistent()
-                    .get::<DataKey, Stream>(&stream_key)
-                {
-                    // Recompute accrued from the updated stream state
-                    let prev_withdrawn = st.withdrawn
-                        .checked_sub(net)
-                        .and_then(|w| {
-                            let fee = compute_fee(&env, &st.token, net);
-                            w.checked_sub(fee)
-                        })
-                        .unwrap_or(st.withdrawn);
-                    
-                    let accrued = st.withdrawn.checked_sub(prev_withdrawn).unwrap_or(0);
-                    let fee = accrued.checked_sub(net).unwrap_or(0);
-                    
-                    WithdrawnEvent {
-                        stream_id,
-                        accrued,
-                        fee,
-                        net,
-                    }
-                    .publish(&env);
+            if accrued > 0 {
+                let fee = accrued.checked_sub(net).unwrap_or(0);
+                WithdrawnEvent {
+                    stream_id,
+                    accrued,
+                    fee,
+                    net,
                 }
+                .publish(&env);
             }
         }
 
