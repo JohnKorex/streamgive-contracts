@@ -1801,6 +1801,105 @@ fn get_stream_on_unknown_id_fails() {
 }
 
 #[test]
+fn get_streams_returns_mixed_existing_and_missing_ids() {
+    let s = setup();
+    s.token_admin.mint(&s.donor, &3_000);
+
+    let a = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+    let b = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &2_000, &20);
+
+    let mut ids = Vec::new(&s.env);
+    ids.push_back(a);
+    ids.push_back(999);
+    ids.push_back(b);
+
+    let streams = s.client.get_streams(&ids);
+
+    assert_eq!(streams.len(), 3);
+    assert_eq!(streams.get(0).unwrap().unwrap(), s.client.get_stream(&a));
+    assert_eq!(streams.get(1), Some(None));
+    assert_eq!(streams.get(2).unwrap().unwrap(), s.client.get_stream(&b));
+}
+
+#[test]
+fn get_streams_returns_none_for_every_missing_id() {
+    let s = setup();
+
+    let mut ids = Vec::new(&s.env);
+    ids.push_back(7);
+    ids.push_back(8);
+
+    let streams = s.client.get_streams(&ids);
+
+    assert_eq!(streams.len(), 2);
+    assert_eq!(streams.get(0), Some(None));
+    assert_eq!(streams.get(1), Some(None));
+}
+
+#[test]
+fn get_streams_with_no_ids_is_empty_and_takes_no_auth() {
+    let s = setup();
+    let ids: Vec<u64> = Vec::new(&s.env);
+
+    let streams = s.client.get_streams(&ids);
+
+    assert_eq!(streams.len(), 0);
+    assert!(s.env.auths().is_empty());
+}
+
+#[test]
+fn get_streams_preserves_order_and_duplicates() {
+    let s = setup();
+    s.token_admin.mint(&s.donor, &2_000);
+
+    let a = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+
+    let mut ids = Vec::new(&s.env);
+    ids.push_back(a);
+    ids.push_back(a);
+    ids.push_back(999);
+    ids.push_back(a);
+
+    let streams = s.client.get_streams(&ids);
+
+    assert_eq!(streams.len(), 4);
+    assert_eq!(streams.get(0).unwrap().unwrap(), s.client.get_stream(&a));
+    assert_eq!(streams.get(1).unwrap().unwrap(), s.client.get_stream(&a));
+    assert_eq!(streams.get(2), Some(None));
+    assert_eq!(streams.get(3).unwrap().unwrap(), s.client.get_stream(&a));
+}
+
+#[test]
+fn get_streams_at_exact_cap_succeeds() {
+    let s = setup();
+    let mut ids = Vec::new(&s.env);
+    for i in 0..MAX_BATCH_GET_STREAMS {
+        ids.push_back(i as u64);
+    }
+
+    let streams = s.client.get_streams(&ids);
+    assert_eq!(streams.len(), MAX_BATCH_GET_STREAMS);
+}
+
+#[test]
+fn get_streams_over_limit_fails_with_exact_error() {
+    let s = setup();
+    let mut ids = Vec::new(&s.env);
+    for i in 0..=MAX_BATCH_GET_STREAMS {
+        ids.push_back(i as u64);
+    }
+
+    let result = s.client.try_get_streams(&ids);
+    assert_eq!(result, Err(Ok(Error::BatchLimitExceeded)));
+}
+
+#[test]
 fn create_stream_stores_every_field() {
     let s = setup();
     s.token_admin.mint(&s.donor, &1_000);

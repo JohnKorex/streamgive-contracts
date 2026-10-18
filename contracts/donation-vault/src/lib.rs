@@ -350,7 +350,13 @@ pub enum Error {
     NotPaused = 22,
     /// Every stream in a batch withdrawal must target the same NGO.
     MixedNgo = 23,
+    /// The number of stream IDs requested in `get_streams` exceeds `MAX_BATCH_GET_STREAMS`.
+    BatchLimitExceeded = 24,
 }
+
+/// Maximum number of streams that can be requested in a single `get_streams` call.
+/// Chosen to stay well within Soroban's per-transaction ledger read footprint limit (40 reads).
+pub const MAX_BATCH_GET_STREAMS: u32 = 40;
 
 const MAX_FEE_BPS: u32 = 1_000;
 
@@ -833,6 +839,54 @@ impl DonationVault {
             .persistent()
             .get(&DataKey::Stream(stream_id))
             .ok_or(Error::StreamNotFound)
+    }
+
+    /// Reads multiple streams in a single call, returning one entry per
+    /// requested id in the same order (`None` for an id that does not exist).
+    /// Read-only; requires no authorization.
+    ///
+    /// Requests with more than `MAX_BATCH_GET_STREAMS` ids are rejected with
+    /// `Error::BatchLimitExceeded`.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// # use soroban_sdk::{testutils::Address as _, token, Address, Env, Vec};
+    /// # use donation_vault::{DonationVault, DonationVaultClient};
+    /// # let env = Env::default();
+    /// # env.mock_all_auths();
+    /// # let contract_id = env.register(DonationVault, ());
+    /// # let client = DonationVaultClient::new(&env, &contract_id);
+    /// # let admin = Address::generate(&env);
+    /// # client.init(&admin);
+    /// # let token_admin = Address::generate(&env);
+    /// # let sac = env.register_stellar_asset_contract_v2(token_admin.clone());
+    /// # let token_client = token::StellarAssetClient::new(&env, &sac.address());
+    /// # let donor = Address::generate(&env);
+    /// # let ngo = Address::generate(&env);
+    /// # token_client.mint(&donor, &2_000);
+    /// let a = client.create_stream(&donor, &ngo, &sac.address(), &1_000, &10);
+    /// let b = client.create_stream(&donor, &ngo, &sac.address(), &1_000, &20);
+    ///
+    /// let mut ids = Vec::new(&env);
+    /// ids.push_back(a);
+    /// ids.push_back(999); // never created
+    /// ids.push_back(b);
+    ///
+    /// let streams = client.get_streams(&ids).unwrap();
+    /// assert!(streams.get(0).unwrap().is_some());
+    /// assert!(streams.get(1).unwrap().is_none());
+    /// assert_eq!(streams.get(2).unwrap().unwrap().rate, 20);
+    /// ```
+    pub fn get_streams(env: Env, ids: Vec<u64>) -> Result<Vec<Option<Stream>>, Error> {
+        if ids.len() > MAX_BATCH_GET_STREAMS {
+            return Err(Error::BatchLimitExceeded);
+        }
+        let mut streams: Vec<Option<Stream>> = Vec::new(&env);
+        for id in ids.iter() {
+            streams.push_back(env.storage().persistent().get(&DataKey::Stream(id)));
+        }
+        Ok(streams)
     }
 
     /// Lists every stream id belonging to `donor`, in creation order.
