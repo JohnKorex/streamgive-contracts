@@ -148,6 +148,19 @@ check_no_existing_deployment() {
   fi
 }
 
+# A contract's wasm hash is sha256 of its built Wasm — the same value the
+# network keys the uploaded code by. Recorded in deployments.json so a
+# consumer can confirm the deployed bytecode matches a reviewed build, and so
+# the "mainnet" and top-level testnet entries share one shape.
+compute_wasm_hash() {
+  local wasm_path="$1"
+  if [ ! -f "$wasm_path" ]; then
+    echo "Error: expected Wasm at $wasm_path after the build." >&2
+    exit 1
+  fi
+  WASM_PATH="$wasm_path" node -e 'process.stdout.write(require("crypto").createHash("sha256").update(require("fs").readFileSync(process.env.WASM_PATH)).digest("hex"))'
+}
+
 validate_address() {
   local val="$1"
   local var_name="$2"
@@ -215,6 +228,11 @@ echo "  RPC URL:           $RPC_URL"
 
 echo "Building contracts (release, wasm32v1-none)..."
 cargo build --workspace --target wasm32v1-none --release
+
+# Computed before the ERR trap is armed: a missing artifact is a build
+# failure, not a part-way deploy.
+NGO_REGISTRY_WASM_HASH=$(compute_wasm_hash "$WASM_DIR/ngo_registry.wasm")
+DONATION_VAULT_WASM_HASH=$(compute_wasm_hash "$WASM_DIR/donation_vault.wasm")
 
 NGO_REGISTRY_ID=""
 DONATION_VAULT_ID=""
@@ -325,6 +343,8 @@ ADMIN_ADDRESS="$ADMIN_ADDRESS" \
 NETWORK_PASSPHRASE="$MAINNET_PASSPHRASE" \
 NGO_REGISTRY_ID="$NGO_REGISTRY_ID" \
 DONATION_VAULT_ID="$DONATION_VAULT_ID" \
+NGO_REGISTRY_WASM_HASH="$NGO_REGISTRY_WASM_HASH" \
+DONATION_VAULT_WASM_HASH="$DONATION_VAULT_WASM_HASH" \
   node -e '
     const fs = require("fs");
     const file = process.env.DEPLOYMENTS_FILE;
@@ -337,6 +357,10 @@ DONATION_VAULT_ID="$DONATION_VAULT_ID" \
       contracts: {
         "ngo-registry": process.env.NGO_REGISTRY_ID,
         "donation-vault": process.env.DONATION_VAULT_ID,
+      },
+      wasm_hashes: {
+        "ngo-registry": process.env.NGO_REGISTRY_WASM_HASH,
+        "donation-vault": process.env.DONATION_VAULT_WASM_HASH,
       },
     };
     fs.writeFileSync(file, JSON.stringify(data, null, 2) + "\n");
