@@ -309,12 +309,23 @@ fn approve_registered_ngo(env: &Env, ngo_owner: Address) -> Result<(), Error> {
 /// shrinking the live counts. Shared by `unregister` (owner-initiated) and
 /// `remove_ngo` (admin-initiated); the caller is responsible for authorizing
 /// the call and for the verified/unverified check. Does not touch the
-/// instance TTL — the caller decides whether to bump it — and does not
-/// decrement `NgoCount`, which is a lifetime registration counter.
+/// instance TTL — the caller decides whether to bump it. Decrements `NgoCount`
+/// using checked subtraction, returning `Error::ArithmeticOverflow` on underflow.
 fn delete_ngo_entry(env: &Env, owner: &Address) -> Result<(), Error> {
+    let count: u64 = env
+        .storage()
+        .instance()
+        .get(&DataKey::NgoCount)
+        .unwrap_or(0);
+    let new_ngo_count = count.checked_sub(1).ok_or(Error::ArithmeticOverflow)?;
+
     env.storage()
         .persistent()
         .remove(&DataKey::Ngo(owner.clone()));
+
+    env.storage()
+        .instance()
+        .set(&DataKey::NgoCount, &new_ngo_count);
 
     // Remove from index using swap-and-pop to maintain a dense [0..count) index
     if let Some(index) = env
@@ -579,6 +590,16 @@ impl NgoRegistry {
             return Err(Error::AlreadyRegistered);
         }
 
+        let count: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::NgoCount)
+            .unwrap_or(0);
+        let new_ngo_count = count.checked_add(1).ok_or(Error::ArithmeticOverflow)?;
+
+        let index = get_owner_count(&env);
+        let new_count = index.checked_add(1).ok_or(Error::ArithmeticOverflow)?;
+
         let ngo = Ngo {
             owner: owner.clone(),
             name: name.clone(),
@@ -586,24 +607,17 @@ impl NgoRegistry {
         };
         env.storage().persistent().set(&key, &ngo);
 
-        let count: u64 = env
-            .storage()
-            .instance()
-            .get(&DataKey::NgoCount)
-            .unwrap_or(0);
         env.storage()
             .instance()
-            .set(&DataKey::NgoCount, &(count + 1));
+            .set(&DataKey::NgoCount, &new_ngo_count);
 
         // Maintain the registered owners index
-        let index = get_owner_count(&env);
         env.storage()
             .persistent()
             .set(&DataKey::OwnerByIndex(index), &owner);
         env.storage()
             .persistent()
             .set(&DataKey::IndexByOwner(owner.clone()), &index);
-        let new_count = index.checked_add(1).ok_or(Error::ArithmeticOverflow)?;
         set_owner_count(&env, new_count);
         env.storage()
             .instance()

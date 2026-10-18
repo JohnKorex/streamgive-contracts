@@ -1447,3 +1447,178 @@ fn remove_ngo_frees_the_index_and_lets_the_owner_register_again() {
     assert!(!client.get_ngo(&b).verified);
     assert_eq!(client.total_ngos(), 3);
 }
+
+// =============================================================================
+// NgoCount accuracy tests (issue #265)
+// =============================================================================
+
+#[test]
+fn register_unregister_register_maintains_count() {
+    let (env, client, _admin) = setup();
+    let owner = Address::generate(&env);
+    let name = String::from_str(&env, "Test NGO");
+
+    assert_eq!(client.ngo_count(), 0);
+
+    client.register(&owner, &name);
+    assert_eq!(client.ngo_count(), 1);
+
+    client.unregister(&owner);
+    assert_eq!(client.ngo_count(), 0);
+
+    client.register(&owner, &name);
+    assert_eq!(client.ngo_count(), 1);
+}
+
+#[test]
+fn two_registrations_one_unregistration_count() {
+    let (env, client, _admin) = setup();
+    let owner1 = Address::generate(&env);
+    let owner2 = Address::generate(&env);
+
+    client.register(&owner1, &String::from_str(&env, "NGO 1"));
+    assert_eq!(client.ngo_count(), 1);
+
+    client.register(&owner2, &String::from_str(&env, "NGO 2"));
+    assert_eq!(client.ngo_count(), 2);
+
+    client.unregister(&owner1);
+    assert_eq!(client.ngo_count(), 1);
+
+    client.remove_ngo(&owner2);
+    assert_eq!(client.ngo_count(), 0);
+}
+
+#[test]
+fn count_stays_consistent_after_deterministic_operations() {
+    let (env, client, _admin) = setup();
+    let a = Address::generate(&env);
+    let b = Address::generate(&env);
+    let c = Address::generate(&env);
+    let d = Address::generate(&env);
+
+    assert_eq!(client.ngo_count(), 0);
+
+    // Register a -> 1
+    client.register(&a, &String::from_str(&env, "A"));
+    assert_eq!(client.ngo_count(), 1);
+
+    // Register b -> 2
+    client.register(&b, &String::from_str(&env, "B"));
+    assert_eq!(client.ngo_count(), 2);
+
+    // Register c -> 3
+    client.register(&c, &String::from_str(&env, "C"));
+    assert_eq!(client.ngo_count(), 3);
+
+    // Unregister b -> 2
+    client.unregister(&b);
+    assert_eq!(client.ngo_count(), 2);
+
+    // Register d -> 3
+    client.register(&d, &String::from_str(&env, "D"));
+    assert_eq!(client.ngo_count(), 3);
+
+    // Admin removes c -> 2
+    client.remove_ngo(&c);
+    assert_eq!(client.ngo_count(), 2);
+
+    // Register b again -> 3
+    client.register(&b, &String::from_str(&env, "B again"));
+    assert_eq!(client.ngo_count(), 3);
+
+    // Unregister a -> 2
+    client.unregister(&a);
+    assert_eq!(client.ngo_count(), 2);
+
+    // Admin removes d -> 1
+    client.remove_ngo(&d);
+    assert_eq!(client.ngo_count(), 1);
+
+    // Unregister b -> 0
+    client.unregister(&b);
+    assert_eq!(client.ngo_count(), 0);
+}
+
+#[test]
+fn unregister_unknown_owner_does_not_change_count() {
+    let (env, client, _admin) = setup();
+    let owner = Address::generate(&env);
+    let unknown = Address::generate(&env);
+
+    client.register(&owner, &String::from_str(&env, "Known NGO"));
+    assert_eq!(client.ngo_count(), 1);
+
+    let res_unreg = client.try_unregister(&unknown);
+    assert_eq!(res_unreg, Err(Ok(Error::NotRegistered)));
+    assert_eq!(client.ngo_count(), 1);
+
+    let res_rem = client.try_remove_ngo(&unknown);
+    assert_eq!(res_rem, Err(Ok(Error::NotRegistered)));
+    assert_eq!(client.ngo_count(), 1);
+}
+
+#[test]
+fn register_overflow_returns_arithmetic_overflow() {
+    let (env, client, _admin) = setup();
+    let owner = Address::generate(&env);
+
+    // Set stored NgoCount to u64::MAX
+    env.as_contract(&client.address, || {
+        env.storage().instance().set(&DataKey::NgoCount, &u64::MAX);
+    });
+
+    let res = client.try_register(&owner, &String::from_str(&env, "Overflow NGO"));
+    assert_eq!(res, Err(Ok(Error::ArithmeticOverflow)));
+    assert_eq!(client.try_get_ngo(&owner), Err(Ok(Error::NotRegistered)));
+}
+
+#[test]
+fn decrement_at_zero_returns_arithmetic_overflow() {
+    let (env, client, _admin) = setup();
+    let owner = Address::generate(&env);
+
+    client.register(&owner, &String::from_str(&env, "Test NGO"));
+    assert_eq!(client.ngo_count(), 1);
+
+    // Corrupt NgoCount to 0 in instance storage
+    env.as_contract(&client.address, || {
+        env.storage().instance().set(&DataKey::NgoCount, &0u64);
+    });
+
+    let res = client.try_unregister(&owner);
+    assert_eq!(res, Err(Ok(Error::ArithmeticOverflow)));
+
+    // Entry should survive because the operation aborted before deletion
+    assert!(client.try_get_ngo(&owner).is_ok());
+
+    let res_rem = client.try_remove_ngo(&owner);
+    assert_eq!(res_rem, Err(Ok(Error::ArithmeticOverflow)));
+    assert!(client.try_get_ngo(&owner).is_ok());
+}
+
+#[test]
+fn failed_register_leaves_count_unchanged() {
+    let (env, client, _admin) = setup();
+    let owner1 = Address::generate(&env);
+    let owner2 = Address::generate(&env);
+
+    client.register(&owner1, &String::from_str(&env, "NGO 1"));
+    assert_eq!(client.ngo_count(), 1);
+
+    // Double register fails
+    let res_double = client.try_register(&owner1, &String::from_str(&env, "NGO 1 again"));
+    assert_eq!(res_double, Err(Ok(Error::AlreadyRegistered)));
+    assert_eq!(client.ngo_count(), 1);
+
+    // Invalid name fails
+    let res_inv = client.try_register(&owner2, &String::from_str(&env, "   "));
+    assert_eq!(res_inv, Err(Ok(Error::InvalidName)));
+    assert_eq!(client.ngo_count(), 1);
+
+    // Name too long fails
+    let too_long = String::from_str(&env, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+    let res_long = client.try_register(&owner2, &too_long);
+    assert_eq!(res_long, Err(Ok(Error::NameTooLong)));
+    assert_eq!(client.ngo_count(), 1);
+}
