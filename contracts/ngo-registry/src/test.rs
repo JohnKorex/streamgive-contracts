@@ -185,6 +185,162 @@ fn update_name_rejects_name_over_max_length() {
 }
 
 #[test]
+fn update_name_accepts_name_at_max_length() {
+    let (env, client, _admin) = setup();
+    let owner = Address::generate(&env);
+    client.register(&owner, &String::from_str(&env, "Initial NGO"));
+    // Exactly MAX_NGO_NAME_LEN (200) bytes.
+    let at_limit = String::from_str(&env, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+
+    client.update_name(&owner, &at_limit);
+    assert_eq!(client.get_ngo(&owner).name, at_limit);
+}
+
+#[test]
+fn register_and_update_name_unicode_whitespace_only_fails() {
+    let (env, client, _admin) = setup();
+    let owner1 = Address::generate(&env);
+    let owner2 = Address::generate(&env);
+    client.register(&owner2, &String::from_str(&env, "Valid NGO"));
+
+    let test_cases = [
+        "\u{00a0}",                         // Non-breaking space
+        "\u{3000}",                         // Ideographic space
+        "\u{2003}",                         // Em space
+        " \t\u{00a0}\u{3000}\u{2003}\n\r ", // Mix with ASCII whitespace
+    ];
+
+    for case in test_cases.iter() {
+        let ws = String::from_str(&env, case);
+        let res_reg = client.try_register(&owner1, &ws);
+        assert_eq!(res_reg, Err(Ok(Error::InvalidName)));
+
+        let res_upd = client.try_update_name(&owner2, &ws);
+        assert_eq!(res_upd, Err(Ok(Error::InvalidName)));
+    }
+}
+
+#[test]
+fn register_and_update_name_zero_width_invisible_only_fails() {
+    let (env, client, _admin) = setup();
+    let owner1 = Address::generate(&env);
+    let owner2 = Address::generate(&env);
+    client.register(&owner2, &String::from_str(&env, "Valid NGO"));
+
+    let test_cases = [
+        "\u{200b}",                                 // Zero-width space
+        "\u{200c}",                                 // Zero-width non-joiner
+        "\u{200d}",                                 // Zero-width joiner
+        "\u{2060}",                                 // Word joiner
+        "\u{feff}",                                 // BOM / Zero-width no-break space
+        "\u{200b}\u{200c}\u{200d}\u{2060}\u{feff}", // All invisible
+        " \u{200b} \t\u{feff}\n",                   // Mixed with whitespace
+    ];
+
+    for case in test_cases.iter() {
+        let inv = String::from_str(&env, case);
+        let res_reg = client.try_register(&owner1, &inv);
+        assert_eq!(res_reg, Err(Ok(Error::InvalidName)));
+
+        let res_upd = client.try_update_name(&owner2, &inv);
+        assert_eq!(res_upd, Err(Ok(Error::InvalidName)));
+    }
+}
+
+#[test]
+fn register_and_update_name_control_characters_fail() {
+    let (env, client, _admin) = setup();
+    let owner1 = Address::generate(&env);
+    let owner2 = Address::generate(&env);
+    client.register(&owner2, &String::from_str(&env, "Valid NGO"));
+
+    let test_cases = [
+        "Charity\u{0000}Name", // NUL
+        "Charity\u{0007}Name", // BEL
+        "Charity\u{001b}Name", // ESC
+        "Charity\u{007f}Name", // DEL
+        "Charity\u{0080}Name", // C1 control (U+0080)
+        "Charity\u{009f}Name", // C1 control (U+009F)
+    ];
+
+    for case in test_cases.iter() {
+        let ctrl = String::from_str(&env, case);
+        let res_reg = client.try_register(&owner1, &ctrl);
+        assert_eq!(res_reg, Err(Ok(Error::InvalidName)));
+
+        let res_upd = client.try_update_name(&owner2, &ctrl);
+        assert_eq!(res_upd, Err(Ok(Error::InvalidName)));
+    }
+}
+
+#[test]
+fn register_and_update_name_internal_unicode_space_succeeds() {
+    let (env, client, _admin) = setup();
+    let owner = Address::generate(&env);
+    let name_ideographic = String::from_str(&env, "Red\u{3000}Cross");
+    let name_nbsp = String::from_str(&env, "Red\u{00a0}Cross");
+
+    // Register with internal ideographic space succeeds
+    client.register(&owner, &name_ideographic);
+    assert_eq!(client.get_ngo(&owner).name, name_ideographic);
+
+    // Update with internal non-breaking space succeeds
+    client.update_name(&owner, &name_nbsp);
+    assert_eq!(client.get_ngo(&owner).name, name_nbsp);
+}
+
+#[test]
+fn register_and_update_name_byte_boundaries_and_multibyte() {
+    let (env, client, _admin) = setup();
+    let owner = Address::generate(&env);
+
+    // Greek capital Omega 'Ω' (U+03A9) is 2 bytes in UTF-8 (0xCE 0xA9).
+    // 100 * 2 bytes = 200 bytes, exactly MAX_NGO_NAME_LEN.
+    let omega_100_str = "ΩΩΩΩΩΩΩΩΩΩΩΩΩΩΩΩΩΩΩΩΩΩΩΩΩΩΩΩΩΩΩΩΩΩΩΩΩΩΩΩΩΩΩΩΩΩΩΩΩΩΩΩΩΩΩΩΩΩΩΩΩΩΩΩΩΩΩΩΩΩΩΩΩΩΩΩΩΩΩΩΩΩΩΩΩΩΩΩΩΩΩΩΩΩΩΩΩΩΩΩ";
+    assert_eq!(omega_100_str.len(), 200);
+    let omega_100 = String::from_str(&env, omega_100_str);
+
+    client.register(&owner, &omega_100);
+    assert_eq!(client.get_ngo(&owner).name, omega_100);
+
+    // 101 Greek capital Omegas = 202 bytes > 200 bytes, rejected with NameTooLong.
+    let omega_101_str = "ΩΩΩΩΩΩΩΩΩΩΩΩΩΩΩΩΩΩΩΩΩΩΩΩΩΩΩΩΩΩΩΩΩΩΩΩΩΩΩΩΩΩΩΩΩΩΩΩΩΩΩΩΩΩΩΩΩΩΩΩΩΩΩΩΩΩΩΩΩΩΩΩΩΩΩΩΩΩΩΩΩΩΩΩΩΩΩΩΩΩΩΩΩΩΩΩΩΩΩΩΩ";
+    assert_eq!(omega_101_str.len(), 202);
+    let omega_101 = String::from_str(&env, omega_101_str);
+
+    let res_upd = client.try_update_name(&owner, &omega_101);
+    assert_eq!(res_upd, Err(Ok(Error::NameTooLong)));
+
+    let owner2 = Address::generate(&env);
+    let res_reg = client.try_register(&owner2, &omega_101);
+    assert_eq!(res_reg, Err(Ok(Error::NameTooLong)));
+
+    // Multi-byte at boundary: 198 'a's + 1 'Ω' (2 bytes) = 200 bytes -> accepted
+    let boundary_200_str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaΩ";
+    assert_eq!(boundary_200_str.len(), 200);
+    let boundary_200 = String::from_str(&env, boundary_200_str);
+    client.update_name(&owner, &boundary_200);
+    assert_eq!(client.get_ngo(&owner).name, boundary_200);
+
+    // 199 'a's + 1 'Ω' (2 bytes) = 201 bytes -> rejected with NameTooLong without panicking
+    let boundary_201_str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaΩ";
+    assert_eq!(boundary_201_str.len(), 201);
+    let boundary_201 = String::from_str(&env, boundary_201_str);
+    let res_boundary = client.try_update_name(&owner, &boundary_201);
+    assert_eq!(res_boundary, Err(Ok(Error::NameTooLong)));
+}
+
+#[test]
+fn validate_name_bytes_rejects_invalid_utf8() {
+    // 0xFF and 0xFE are never valid in UTF-8
+    assert_eq!(validate_name_bytes(&[0xFF, 0xFE]), Err(Error::InvalidName));
+    // Overlong NUL (0xC0 0x80)
+    assert_eq!(validate_name_bytes(&[0xC0, 0x80]), Err(Error::InvalidName));
+    // Lone continuation byte (0x80)
+    assert_eq!(validate_name_bytes(&[0x80]), Err(Error::InvalidName));
+}
+
+#[test]
 fn get_unregistered_ngo_fails() {
     let (env, client, _admin) = setup();
     let random = Address::generate(&env);
