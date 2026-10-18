@@ -47,6 +47,52 @@ fn init_without_admin_auth_fails() {
 }
 
 #[test]
+fn init_publishes_init_event() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let contract_id = env.register(NgoRegistry, ());
+    let client = NgoRegistryClient::new(&env, &contract_id);
+
+    client.init(&admin);
+
+    assert_eq!(
+        env.events().all(),
+        vec![
+            &env,
+            (
+                contract_id.clone(),
+                (symbol_short!("init"),).into_val(&env),
+                admin.into_val(&env),
+            ),
+        ]
+    );
+}
+
+#[test]
+fn constructor_publishes_init_event() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+
+    // The constructor is the latest top-level invocation, so its event is the
+    // only contract event in the buffer.
+    let contract_id = env.register(NgoRegistry, NgoRegistryArgs::__constructor(&admin));
+
+    assert_eq!(
+        env.events().all(),
+        vec![
+            &env,
+            (
+                contract_id.clone(),
+                (symbol_short!("init"),).into_val(&env),
+                admin.into_val(&env),
+            ),
+        ]
+    );
+}
+
+#[test]
 fn register_ngo_stores_unverified_entry() {
     let (env, client, _admin) = setup();
     let owner = Address::generate(&env);
@@ -841,6 +887,29 @@ fn upgrade_preserves_state() {
     assert_eq!(ngo_before.verified, ngo_after.verified);
     assert_eq!(client.ngo_count(), 1);
 }
+
+#[test]
+fn upgrade_publishes_event() {
+    let (env, client, _admin) = setup();
+    // Upload any bytes so the upgrade target exists; the host only checks
+    // that the hash is present, not that it is executable.
+    let new_wasm_hash = env.deployer().upload_contract_wasm(Bytes::new(&env));
+
+    client.upgrade(&new_wasm_hash);
+
+    assert_eq!(
+        env.events().all(),
+        vec![
+            &env,
+            (
+                client.address.clone(),
+                (symbol_short!("upgrade"),).into_val(&env),
+                new_wasm_hash.into_val(&env),
+            ),
+        ]
+    );
+}
+
 // list_ngos pagination tests (issue #283)
 // =============================================================================
 

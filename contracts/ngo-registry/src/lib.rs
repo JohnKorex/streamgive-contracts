@@ -62,6 +62,16 @@ pub struct CancelledAdminEvent {
     pub data: (),
 }
 
+#[contractevent(topics = ["init"], data_format = "single-value")]
+pub struct InitializedEvent {
+    pub admin: Address,
+}
+
+#[contractevent(topics = ["upgrade"], data_format = "single-value")]
+pub struct UpgradedEvent {
+    pub new_wasm_hash: BytesN<32>,
+}
+
 #[contracttype]
 // Debug and PartialEq let tests assert_eq! on a try_* call’s full
 // Result<Result<Ngo, _>, _> rather than unwrapping it by hand first.
@@ -288,6 +298,7 @@ impl NgoRegistry {
     pub fn __constructor(env: Env, admin: Address) {
         env.storage().instance().set(&DataKey::Admin, &admin);
         extend_instance_ttl(&env);
+        InitializedEvent { admin }.publish(&env);
     }
 
     /// Sets the registry admin. Can only be called once. Neutralized in favor of
@@ -312,6 +323,7 @@ impl NgoRegistry {
         }
         env.storage().instance().set(&DataKey::Admin, &admin);
         extend_instance_ttl(&env);
+        InitializedEvent { admin }.publish(&env);
         Ok(())
     }
 
@@ -994,7 +1006,9 @@ impl NgoRegistry {
     /// ```
     pub fn upgrade(env: Env, new_wasm_hash: BytesN<32>) -> Result<(), Error> {
         require_admin(&env)?;
-        env.deployer().update_current_contract_wasm(new_wasm_hash);
+        env.deployer()
+            .update_current_contract_wasm(new_wasm_hash.clone());
+        UpgradedEvent { new_wasm_hash }.publish(&env);
         Ok(())
     }
 }
