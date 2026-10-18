@@ -194,6 +194,35 @@ fn require_admin(env: &Env) -> Result<Address, Error> {
     Ok(admin)
 }
 
+/// Marks one registered, unverified NGO as verified and publishes its
+/// `approved` event. Shared by `approve_ngo` and `batch_approve` so a single
+/// approval behaves the same whichever entry point drives it: an address with
+/// no entry fails with `Error::NotRegistered`, and one that is already
+/// verified with `Error::AlreadyVerified`.
+fn approve_registered_ngo(env: &Env, ngo_owner: Address) -> Result<(), Error> {
+    let key = DataKey::Ngo(ngo_owner.clone());
+    let mut ngo: Ngo = env
+        .storage()
+        .persistent()
+        .get(&key)
+        .ok_or(Error::NotRegistered)?;
+    if ngo.verified {
+        return Err(Error::AlreadyVerified);
+    }
+    ngo.verified = true;
+    env.storage().persistent().set(&key, &ngo);
+    extend_instance_ttl(env);
+    extend_ngo_ttl(env, &ngo_owner);
+
+    ApprovedEvent {
+        owner: ngo_owner,
+        data: (),
+    }
+    .publish(env);
+
+    Ok(())
+}
+
 #[contract]
 pub struct NgoRegistry;
 
@@ -747,27 +776,40 @@ impl NgoRegistry {
     /// ```
     pub fn approve_ngo(env: Env, ngo_owner: Address) -> Result<(), Error> {
         require_admin(&env)?;
+        approve_registered_ngo(&env, ngo_owner)
+    }
 
-        let key = DataKey::Ngo(ngo_owner.clone());
-        let mut ngo: Ngo = env
-            .storage()
-            .persistent()
-            .get(&key)
-            .ok_or(Error::NotRegistered)?;
-        if ngo.verified {
-            return Err(Error::AlreadyVerified);
+    /// Marks several registered NGOs as verified in a single call. Admin-only.
+    ///
+    /// Approves each owner in order, publishing one `approved` event per NGO
+    /// exactly as `approve_ngo` would. The call is atomic: if any owner has no
+    /// entry (`Error::NotRegistered`) or is already verified
+    /// (`Error::AlreadyVerified`, which also covers an owner repeated within
+    /// the same batch) nothing is approved and no event is published. An empty
+    /// batch succeeds and emits nothing.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// # use soroban_sdk::{testutils::Address as _, vec, Address, Env, String};
+    /// # use ngo_registry::{NgoRegistry, NgoRegistryArgs, NgoRegistryClient};
+    /// # let env = Env::default();
+    /// # env.mock_all_auths();
+    /// # let admin = Address::generate(&env);
+    /// # let contract_id = env.register(NgoRegistry, NgoRegistryArgs::__constructor(&admin));
+    /// # let client = NgoRegistryClient::new(&env, &contract_id);
+    /// let a = Address::generate(&env);
+    /// let b = Address::generate(&env);
+    /// client.register(&a, &String::from_str(&env, "Red Cross"));
+    /// client.register(&b, &String::from_str(&env, "Oxfam"));
+    ///
+    /// client.batch_approve(&vec![&env, a, b]);
+    /// ```
+    pub fn batch_approve(env: Env, owners: Vec<Address>) -> Result<(), Error> {
+        require_admin(&env)?;
+        for ngo_owner in owners.iter() {
+            approve_registered_ngo(&env, ngo_owner)?;
         }
-        ngo.verified = true;
-        env.storage().persistent().set(&key, &ngo);
-        extend_instance_ttl(&env);
-        extend_ngo_ttl(&env, &ngo_owner);
-
-        ApprovedEvent {
-            owner: ngo_owner,
-            data: (),
-        }
-        .publish(&env);
-
         Ok(())
     }
 

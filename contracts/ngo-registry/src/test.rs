@@ -222,6 +222,124 @@ fn approve_unregistered_ngo_fails() {
     assert_eq!(result, Err(Ok(Error::NotRegistered)));
 }
 
+// =============================================================================
+// batch_approve (issue #275)
+// =============================================================================
+
+#[test]
+fn batch_approve_approves_each_ngo_and_publishes_events() {
+    let (env, client, _admin) = setup();
+    let a = Address::generate(&env);
+    let b = Address::generate(&env);
+    let c = Address::generate(&env);
+    client.register(&a, &String::from_str(&env, "Red Cross"));
+    client.register(&b, &String::from_str(&env, "Oxfam"));
+    client.register(&c, &String::from_str(&env, "Save the Children"));
+
+    client.batch_approve(&vec![&env, a.clone(), b.clone(), c.clone()]);
+
+    assert!(client.get_ngo(&a).verified);
+    assert!(client.get_ngo(&b).verified);
+    assert!(client.get_ngo(&c).verified);
+
+    // One `approved` event per NGO, in batch order.
+    assert_eq!(
+        env.events().all(),
+        vec![
+            &env,
+            (
+                client.address.clone(),
+                (symbol_short!("approved"), a).into_val(&env),
+                ().into_val(&env),
+            ),
+            (
+                client.address.clone(),
+                (symbol_short!("approved"), b).into_val(&env),
+                ().into_val(&env),
+            ),
+            (
+                client.address.clone(),
+                (symbol_short!("approved"), c).into_val(&env),
+                ().into_val(&env),
+            ),
+        ]
+    );
+}
+
+#[test]
+fn batch_approve_reverts_atomically_on_unregistered_ngo() {
+    let (env, client, _admin) = setup();
+    let registered = Address::generate(&env);
+    let unknown = Address::generate(&env);
+    client.register(&registered, &String::from_str(&env, "Red Cross"));
+
+    let result = client.try_batch_approve(&vec![&env, registered.clone(), unknown]);
+
+    assert_eq!(result, Err(Ok(Error::NotRegistered)));
+    // The whole batch rolls back: the registered NGO is still pending.
+    assert!(!client.get_ngo(&registered).verified);
+}
+
+#[test]
+fn batch_approve_reverts_atomically_on_already_verified_ngo() {
+    let (env, client, _admin) = setup();
+    let verified = Address::generate(&env);
+    let pending = Address::generate(&env);
+    client.register(&verified, &String::from_str(&env, "Red Cross"));
+    client.register(&pending, &String::from_str(&env, "Oxfam"));
+    client.approve_ngo(&verified);
+
+    let result = client.try_batch_approve(&vec![&env, pending.clone(), verified.clone()]);
+
+    assert_eq!(result, Err(Ok(Error::AlreadyVerified)));
+    assert!(!client.get_ngo(&pending).verified);
+    assert!(client.get_ngo(&verified).verified);
+}
+
+#[test]
+fn batch_approve_rejects_a_duplicate_owner() {
+    let (env, client, _admin) = setup();
+    let owner = Address::generate(&env);
+    client.register(&owner, &String::from_str(&env, "Red Cross"));
+
+    let result = client.try_batch_approve(&vec![&env, owner.clone(), owner.clone()]);
+
+    assert_eq!(result, Err(Ok(Error::AlreadyVerified)));
+    assert!(!client.get_ngo(&owner).verified);
+}
+
+#[test]
+fn batch_approve_empty_batch_is_a_noop() {
+    let (env, client, _admin) = setup();
+    let empty: Vec<Address> = Vec::new(&env);
+
+    assert_eq!(client.try_batch_approve(&empty), Ok(Ok(())));
+    assert_eq!(env.events().all().events().len(), 0);
+}
+
+#[test]
+fn batch_approve_bumps_instance_and_ngo_ttl() {
+    let (env, client, _admin) = setup();
+    let owner = Address::generate(&env);
+    client.register(&owner, &String::from_str(&env, "Red Cross"));
+    age_past_thresholds(&env, &client, &owner);
+
+    client.batch_approve(&vec![&env, owner.clone()]);
+
+    assert_ttls_bumped(&env, &client, &owner);
+}
+
+#[test]
+#[should_panic]
+fn batch_approve_without_admin_auth_fails() {
+    let (env, client, _admin) = setup();
+    let owner = Address::generate(&env);
+    client.register(&owner, &String::from_str(&env, "Red Cross"));
+
+    env.mock_auths(&[]);
+    client.batch_approve(&vec![&env, owner]);
+}
+
 #[test]
 fn revoke_ngo_clears_verified_status() {
     let (env, client, _admin) = setup();
