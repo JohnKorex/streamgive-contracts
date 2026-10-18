@@ -357,11 +357,17 @@ pub enum Error {
     MixedNgo = 23,
     /// The number of stream IDs requested in `get_streams` exceeds `MAX_BATCH_GET_STREAMS`.
     BatchLimitExceeded = 24,
+    /// `withdraw_batch` was called with duplicate stream IDs.
+    DuplicateStreamId = 25,
 }
 
 /// Maximum number of streams that can be requested in a single `get_streams` call.
 /// Chosen to stay well within Soroban's per-transaction ledger read footprint limit (40 reads).
 pub const MAX_BATCH_GET_STREAMS: u32 = 40;
+
+/// Maximum number of streams that can be withdrawn in a single `withdraw_batch` call.
+/// Chosen to stay well within Soroban's per-transaction CPU and footprint budget.
+pub const MAX_BATCH_WITHDRAW_STREAMS: u32 = 20;
 
 const MAX_FEE_BPS: u32 = 1_000;
 
@@ -2005,6 +2011,11 @@ impl DonationVault {
     /// stream (matching `withdraw` and `pending_payout`), then the net amounts
     /// are aggregated per token for transfer.
     ///
+    /// Returns `Error::BatchLimitExceeded` if more than `MAX_BATCH_WITHDRAW_STREAMS`
+    /// ids are provided. Returns `Error::DuplicateStreamId` if the same id appears
+    /// multiple times. Returns `Error::NothingToWithdraw` if no stream in the batch
+    /// has accrued anything.
+    ///
     /// Returns the net payout for each input stream, in the same
     /// order as `stream_ids` (0 for a stream that had nothing to withdraw).
     ///
@@ -2040,12 +2051,27 @@ impl DonationVault {
     pub fn withdraw_batch(env: Env, stream_ids: Vec<u64>) -> Result<Vec<i128>, Error> {
         require_not_paused(&env)?;
 
+        // Cap the number of streams per batch to stay within CPU and footprint budget
+        if stream_ids.len() > MAX_BATCH_WITHDRAW_STREAMS {
+            return Err(Error::BatchLimitExceeded);
+        }
+
+        // Reject duplicate stream IDs
+        let mut seen_ids: Map<u64, bool> = Map::new(&env);
+        for stream_id in stream_ids.iter() {
+            if seen_ids.contains_key(stream_id) {
+                return Err(Error::DuplicateStreamId);
+            }
+            seen_ids.set(stream_id, true);
+        }
+
         let now = env.ledger().timestamp();
         let mut ngo: Option<Address> = None;
         let mut net_amounts: Vec<i128> = Vec::new(&env);
         let mut accrued_amounts: Vec<i128> = Vec::new(&env);
         let mut net_payouts: Map<Address, i128> = Map::new(&env);
         let mut fee_payouts: Map<Address, i128> = Map::new(&env);
+        let mut total_accrued: i128 = 0;
 
         for stream_id in stream_ids.iter() {
             let key = DataKey::Stream(stream_id);
@@ -2072,6 +2098,9 @@ impl DonationVault {
             let elapsed = now.saturating_sub(stream.last_update);
             let accrued = math::accrued(stream.rate, elapsed, stream.balance);
             accrued_amounts.push_back(accrued);
+            total_accrued = total_accrued
+                .checked_add(accrued)
+                .ok_or(Error::ArithmeticOverflow)?;
             
             let fee = if accrued > 0 {
                 compute_fee(&env, &stream.token, accrued)
@@ -2087,6 +2116,9 @@ impl DonationVault {
 
             record_payout(&mut stream, accrued)?;
             stream.last_update = now;
+            if stream.balance == 0 {
+                stream.status = StreamStatus::Drained;
+            }
             env.storage().persistent().set(&key, &stream);
             extend_stream_ttl(&env, stream_id);
 
@@ -2109,6 +2141,11 @@ impl DonationVault {
                         .ok_or(Error::ArithmeticOverflow)?,
                 );
             }
+        }
+
+        // Return NothingToWithdraw when no stream pays anything
+        if total_accrued <= 0 {
+            return Err(Error::NothingToWithdraw);
         }
 
         if let Some(ngo) = ngo {
