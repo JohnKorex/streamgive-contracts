@@ -1639,33 +1639,25 @@ fn cancel_stream_twice_is_harmless() {
     assert_eq!(stream.withdrawn, 500);
     assert!(stream.cancelled);
 
-    // Cancelling again settles zero (rate and balance are already zero) and
-    // refunds zero, leaving balances and stream state unchanged.
+    // Cancelling again returns StreamCancelled error without rewriting storage
+    // or resetting last_update, maintaining consistency with top_up and modify_rate.
     s.env.ledger().with_mut(|l| l.timestamp += 50);
-    let refund = s.client.cancel_stream(&stream_id);
-    assert_eq!(refund, 0);
+    let last_update_before_second_cancel = stream.last_update;
+    
+    let result = s.client.try_cancel_stream(&stream_id);
+    assert_eq!(result, Err(Ok(Error::StreamCancelled)));
 
-    // Sampled here, before any further SDK call: `events().all()` only covers
-    // the most recent invocation, so reading a balance or the stream below
-    // would reset the buffer and make the comparison below vacuous.
-    let events_after_second_cancel = event_count(&s.env, &s.client.address);
-
+    // Balances remain unchanged
     assert_eq!(s.token.balance(&s.ngo), 500);
     assert_eq!(s.token.balance(&s.donor), 500);
 
-    let stream = s.client.get_stream(&stream_id);
-    assert_eq!(stream.balance, 0);
-    assert_eq!(stream.rate, 0);
-    assert_eq!(stream.withdrawn, 500);
-    assert!(stream.cancelled);
-
-    // accrued and refund were both zero, so the second cancel must publish
-    // nothing. A duplicate cancel event is indistinguishable from a real
-    // cancellation to an indexer watching the topic (issue #91).
-    assert_eq!(
-        events_after_second_cancel, 0,
-        "a duplicate cancel event was emitted for an already-cancelled stream"
-    );
+    // Stream state remains unchanged (not rewritten)
+    let stream_after = s.client.get_stream(&stream_id);
+    assert_eq!(stream_after.balance, 0);
+    assert_eq!(stream_after.rate, 0);
+    assert_eq!(stream_after.withdrawn, 500);
+    assert!(stream_after.cancelled);
+    assert_eq!(stream_after.last_update, last_update_before_second_cancel);
 }
 
 #[test]
