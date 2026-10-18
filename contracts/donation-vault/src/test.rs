@@ -4380,6 +4380,38 @@ fn modify_rate_and_top_up_on_a_drained_stream() {
     assert_eq!(s.client.pending_accrual(&stream_id), 200);
 }
 
+#[test]
+fn settle_marks_stream_drained_when_balance_reaches_zero() {
+    let s = setup();
+    s.token_admin.mint(&s.donor, &1_000);
+
+    // Create a stream that will drain exactly after modify_rate settles
+    let stream_id = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+
+    // Advance exactly 100 seconds so the entire balance accrues
+    s.env.ledger().with_mut(|l| l.timestamp += 100);
+
+    // modify_rate calls settle, which should drain the stream and mark it Drained
+    s.client.modify_rate(&stream_id, &20);
+
+    let stream = s.client.get_stream(&stream_id);
+    assert_eq!(stream.balance, 0);
+    assert_eq!(stream.rate, 20);
+    assert_eq!(stream.status, StreamStatus::Drained);
+    assert!(!stream.cancelled);
+
+    // Verify the NGO received all accrued funds
+    assert_eq!(s.token.balance(&s.ngo), 1_000);
+
+    // modify_rate is still allowed on a drained stream
+    s.client.modify_rate(&stream_id, &5);
+    let after = s.client.get_stream(&stream_id);
+    assert_eq!(after.rate, 5);
+    assert_eq!(after.status, StreamStatus::Drained);
+}
+
 // =============================================================================
 // configuration events (issue #277)
 // =============================================================================

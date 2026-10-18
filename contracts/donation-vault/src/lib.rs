@@ -550,6 +550,11 @@ fn settle(env: &Env, stream: &mut Stream, now: u64) -> Result<i128, Error> {
     }
     stream.last_update = now;
 
+    // Mark as Drained if settle emptied the balance
+    if stream.balance == 0 && stream.status == StreamStatus::Active {
+        stream.status = StreamStatus::Drained;
+    }
+
     // External token transfer is the last step
     if accrued > 0 {
         let token_client = token::Client::new(env, &stream.token);
