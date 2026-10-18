@@ -1622,3 +1622,59 @@ fn failed_register_leaves_count_unchanged() {
     assert_eq!(res_long, Err(Ok(Error::NameTooLong)));
     assert_eq!(client.ngo_count(), 1);
 }
+
+// =============================================================================
+// total_ngos alias tests (issue #264)
+// =============================================================================
+
+#[test]
+fn total_ngos_alias_agrees_with_ngo_count() {
+    let (env, client, _admin) = setup();
+    let a = Address::generate(&env);
+    let b = Address::generate(&env);
+
+    // Initial state: both agree at zero
+    assert_eq!(client.ngo_count(), 0);
+    assert_eq!(client.total_ngos(), 0);
+
+    // Register two NGOs: both getters agree
+    client.register(&a, &String::from_str(&env, "NGO A"));
+    assert_eq!(client.ngo_count(), 1);
+    assert_eq!(client.total_ngos(), 1);
+
+    client.register(&b, &String::from_str(&env, "NGO B"));
+    assert_eq!(client.ngo_count(), 2);
+    assert_eq!(client.total_ngos(), 2);
+
+    // Unregister sequence: both getters agree after removal
+    client.unregister(&a);
+    assert_eq!(client.ngo_count(), 1);
+    assert_eq!(client.total_ngos(), 1);
+
+    // Admin removal: both getters agree back to zero
+    client.remove_ngo(&b);
+    assert_eq!(client.ngo_count(), 0);
+    assert_eq!(client.total_ngos(), 0);
+}
+
+#[test]
+fn total_ngos_alias_register_unregister_register_sequence() {
+    let (env, client, _admin) = setup();
+    let owner = Address::generate(&env);
+    let name = String::from_str(&env, "NGO Test");
+
+    assert_eq!(client.total_ngos(), 0);
+    assert_eq!(client.ngo_count(), 0);
+
+    client.register(&owner, &name);
+    assert_eq!(client.total_ngos(), 1);
+    assert_eq!(client.ngo_count(), 1);
+
+    client.unregister(&owner);
+    assert_eq!(client.total_ngos(), 0);
+    assert_eq!(client.ngo_count(), 0);
+
+    client.register(&owner, &name);
+    assert_eq!(client.total_ngos(), 1);
+    assert_eq!(client.ngo_count(), 1);
+}

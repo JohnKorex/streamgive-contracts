@@ -89,7 +89,8 @@ pub enum DataKey {
     Admin,
     /// The administrator nominated to take over, pending acceptance.
     PendingAdmin,
-    /// Running total of registered NGOs (a `u32`, seeded from `NgoCount`).
+    /// Unused and reserved. Preserved to maintain enum discriminant stability
+    /// for existing deployed contracts. Callers should read `NgoCount` via `ngo_count()`.
     TotalNgos,
     /// The registry record keyed by an NGO owner's address.
     Ngo(Address),
@@ -358,7 +359,6 @@ fn delete_ngo_entry(env: &Env, owner: &Address) -> Result<(), Error> {
                 .persistent()
                 .remove(&DataKey::IndexByOwner(owner.clone()));
             set_owner_count(env, last_index);
-            env.storage().instance().set(&DataKey::TotalNgos, &last_index);
         }
     }
 
@@ -619,9 +619,6 @@ impl NgoRegistry {
             .persistent()
             .set(&DataKey::IndexByOwner(owner.clone()), &index);
         set_owner_count(&env, new_count);
-        env.storage()
-            .instance()
-            .set(&DataKey::TotalNgos, &new_count);
 
         extend_instance_ttl(&env);
         extend_ngo_ttl(&env, &owner);
@@ -632,12 +629,16 @@ impl NgoRegistry {
         Ok(())
     }
 
-    /// Returns the number of successfully registered NGOs.
+    /// Deprecated alias of [`ngo_count`](Self::ngo_count).
+    ///
+    /// Reads the same single stored counter (`NgoCount`) as `ngo_count()`.
+    /// Preserved for backwards compatibility with existing callers.
+    ///
+    /// # Conversion
+    /// Returns the live count as `u32`. If the stored `u64` count exceeds
+    /// `u32::MAX`, saturates at `u32::MAX`. Callers should prefer [`ngo_count`](Self::ngo_count).
     pub fn total_ngos(env: Env) -> u32 {
-        env.storage()
-            .instance()
-            .get(&DataKey::TotalNgos)
-            .unwrap_or(0)
+        u32::try_from(Self::ngo_count(env)).unwrap_or(u32::MAX)
     }
 
     /// Removes the caller's unverified NGO application.
