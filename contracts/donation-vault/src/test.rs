@@ -2572,11 +2572,48 @@ fn non_admin_cannot_set_the_per_donor_cap() {
 }
 
 #[test]
+fn create_stream_rejects_self_stream() {
+    let s = setup();
+    s.token_admin.mint(&s.donor, &2_000);
+
+    // Positive control: valid distinct donor and NGO succeeds
+    let stream_id = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+    assert_eq!(s.client.get_stream(&stream_id).balance, 1_000);
+
+    // Targeted check: donor == ngo fails with SelfStream
+    let result = s
+        .client
+        .try_create_stream(&s.donor, &s.donor, &s.token.address, &1_000, &10);
+    assert_eq!(result, Err(Ok(Error::SelfStream)));
+}
+
+#[test]
+fn create_stream_rejects_deposit_too_low() {
+    let s = setup();
+    s.token_admin.mint(&s.donor, &2_000);
+    s.client.set_min_deposit(&1_000);
+
+    // Targeted check: valid distinct parties, deposit below min_deposit fails with DepositTooLow
+    let result = s
+        .client
+        .try_create_stream(&s.donor, &s.ngo, &s.token.address, &999, &10);
+    assert_eq!(result, Err(Ok(Error::DepositTooLow)));
+
+    // Positive control: meeting min_deposit succeeds
+    let stream_id = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+    assert_eq!(s.client.get_stream(&stream_id).balance, 1_000);
+}
+
+#[test]
 fn create_stream_rejects_the_101st_stream() {
     let s = setup();
     s.token_admin.mint(&s.donor, &1_000_000);
 
-    // Fill the default cap.
+    // Fill the default per-donor cap (100 streams).
     for _ in 0..100 {
         s.client
             .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
@@ -2585,8 +2622,17 @@ fn create_stream_rejects_the_101st_stream() {
     let result = s
         .client
         .try_create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
-    assert!(result.is_err());
+    assert_eq!(result, Err(Ok(Error::StreamLimitExceeded)));
+
+    // Positive control: cap is per-donor, so a different donor can still create a stream
+    let other_donor = Address::generate(&s.env);
+    s.token_admin.mint(&other_donor, &1_000);
+    let other_id = s
+        .client
+        .create_stream(&other_donor, &s.ngo, &s.token.address, &1_000, &10);
+    assert_eq!(s.client.get_stream(&other_id).donor, other_donor);
 }
+
 
 #[test]
 fn raising_the_cap_lets_the_next_stream_through() {
@@ -2601,7 +2647,7 @@ fn raising_the_cap_lets_the_next_stream_through() {
     let result = s
         .client
         .try_create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
-    assert!(result.is_err());
+    assert_eq!(result, Err(Ok(Error::StreamLimitExceeded)));
 
     // Raise the cap. Next call succeeds.
     s.client.set_max_streams_per_donor(&2);
@@ -2629,7 +2675,7 @@ fn lowering_the_cap_does_not_retroactively_affect_existing_streams() {
     let result = s
         .client
         .try_create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
-    assert!(result.is_err());
+    assert_eq!(result, Err(Ok(Error::StreamLimitExceeded)));
 
     // Existing streams are untouched and still withdrawable.
     s.env.ledger().with_mut(|l| l.timestamp += 50);
