@@ -1095,3 +1095,130 @@ fn unregister_verified_ngo_fails() {
     assert!(client.get_ngo(&owner).verified);
     assert_eq!(client.list_ngos(&0, &10).len(), 1);
 }
+
+// =============================================================================
+// remove_ngo (issue #282)
+// =============================================================================
+
+#[test]
+fn remove_ngo_deletes_unverified_entry() {
+    let (env, client, _admin) = setup();
+    let owner = Address::generate(&env);
+    client.register(&owner, &String::from_str(&env, "Red Cross"));
+    assert_eq!(client.total_ngos(), 1);
+
+    client.remove_ngo(&owner);
+
+    assert_eq!(client.try_get_ngo(&owner), Err(Ok(Error::NotRegistered)));
+    assert!(!client.is_verified(&owner));
+    assert_eq!(client.total_ngos(), 0);
+    assert_eq!(client.list_ngos(&0, &10).len(), 0);
+}
+
+#[test]
+fn remove_ngo_publishes_event() {
+    let (env, client, _admin) = setup();
+    let owner = Address::generate(&env);
+    client.register(&owner, &String::from_str(&env, "Red Cross"));
+
+    client.remove_ngo(&owner);
+
+    // Events are cleared per top-level call; only the removed event is visible.
+    assert_eq!(
+        env.events().all(),
+        vec![
+            &env,
+            (
+                client.address.clone(),
+                (symbol_short!("removed"), owner).into_val(&env),
+                ().into_val(&env),
+            ),
+        ]
+    );
+}
+
+#[test]
+fn remove_ngo_rejects_a_verified_ngo() {
+    let (env, client, _admin) = setup();
+    let owner = Address::generate(&env);
+    client.register(&owner, &String::from_str(&env, "Red Cross"));
+    client.approve_ngo(&owner);
+
+    let result = client.try_remove_ngo(&owner);
+
+    assert_eq!(result, Err(Ok(Error::AlreadyVerified)));
+    // Still there, still verified: revoke_ngo is the way to undo an approval.
+    assert!(client.get_ngo(&owner).verified);
+    assert_eq!(client.total_ngos(), 1);
+}
+
+#[test]
+fn remove_ngo_after_revocation_succeeds() {
+    let (env, client, _admin) = setup();
+    let owner = Address::generate(&env);
+    client.register(&owner, &String::from_str(&env, "Red Cross"));
+    client.approve_ngo(&owner);
+    client.revoke_ngo(&owner);
+
+    client.remove_ngo(&owner);
+
+    assert_eq!(client.try_get_ngo(&owner), Err(Ok(Error::NotRegistered)));
+    assert_eq!(client.total_ngos(), 0);
+}
+
+#[test]
+fn remove_ngo_unknown_owner_fails() {
+    let (env, client, _admin) = setup();
+    let unknown = Address::generate(&env);
+
+    let result = client.try_remove_ngo(&unknown);
+
+    assert_eq!(result, Err(Ok(Error::NotRegistered)));
+}
+
+#[test]
+fn remove_ngo_requires_admin_auth() {
+    let (env, client, admin) = setup();
+    let owner = Address::generate(&env);
+    client.register(&owner, &String::from_str(&env, "Red Cross"));
+
+    client.remove_ngo(&owner);
+
+    assert_sole_auth(&env, &client, &admin, "remove_ngo");
+}
+
+#[test]
+#[should_panic]
+fn remove_ngo_without_admin_auth_fails() {
+    let (env, client, _admin) = setup();
+    let owner = Address::generate(&env);
+    client.register(&owner, &String::from_str(&env, "Red Cross"));
+
+    env.mock_auths(&[]);
+    client.remove_ngo(&owner);
+}
+
+#[test]
+fn remove_ngo_frees_the_index_and_lets_the_owner_register_again() {
+    let (env, client, _admin) = setup();
+    let a = Address::generate(&env);
+    let b = Address::generate(&env);
+    let c = Address::generate(&env);
+    client.register(&a, &String::from_str(&env, "A"));
+    client.register(&b, &String::from_str(&env, "B"));
+    client.register(&c, &String::from_str(&env, "C"));
+
+    // Removing the middle entry swaps the last one into its slot.
+    client.remove_ngo(&b);
+
+    let owners = client.list_ngos(&0, &10);
+    assert_eq!(owners.len(), 2);
+    assert_eq!(owners.get(0).unwrap(), a);
+    assert_eq!(owners.get(1).unwrap(), c);
+    assert_eq!(client.total_ngos(), 2);
+
+    // The freed owner can apply again from scratch.
+    client.register(&b, &String::from_str(&env, "B again"));
+    assert!(!client.get_ngo(&b).verified);
+    assert_eq!(client.total_ngos(), 3);
+}

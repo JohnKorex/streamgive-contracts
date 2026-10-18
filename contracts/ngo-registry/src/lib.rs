@@ -40,6 +40,13 @@ pub struct UnregisteredEvent {
     pub data: (),
 }
 
+#[contractevent(topics = ["removed"], data_format = "single-value")]
+pub struct RemovedEvent {
+    #[topic]
+    pub owner: Address,
+    pub data: (),
+}
+
 #[contractevent(topics = ["propadmin"], data_format = "single-value")]
 pub struct ProposedAdminEvent {
     pub admin: Address,
@@ -219,6 +226,55 @@ fn approve_registered_ngo(env: &Env, ngo_owner: Address) -> Result<(), Error> {
         data: (),
     }
     .publish(env);
+
+    Ok(())
+}
+
+/// Deletes an NGO's registry entry and its position in the owners index,
+/// shrinking the live counts. Shared by `unregister` (owner-initiated) and
+/// `remove_ngo` (admin-initiated); the caller is responsible for authorizing
+/// the call and for the verified/unverified check. Does not touch the
+/// instance TTL — the caller decides whether to bump it — and does not
+/// decrement `NgoCount`, which is a lifetime registration counter.
+fn delete_ngo_entry(env: &Env, owner: &Address) -> Result<(), Error> {
+    env.storage()
+        .persistent()
+        .remove(&DataKey::Ngo(owner.clone()));
+
+    // Remove from index using swap-and-pop to maintain a dense [0..count) index
+    if let Some(index) = env
+        .storage()
+        .persistent()
+        .get::<_, u32>(&DataKey::IndexByOwner(owner.clone()))
+    {
+        let count = get_owner_count(env);
+        if count > 0 {
+            let last_index = count.checked_sub(1).ok_or(Error::ArithmeticOverflow)?;
+            if index != last_index {
+                if let Some(last_owner) = env
+                    .storage()
+                    .persistent()
+                    .get::<_, Address>(&DataKey::OwnerByIndex(last_index))
+                {
+                    env.storage()
+                        .persistent()
+                        .set(&DataKey::OwnerByIndex(index), &last_owner);
+                    env.storage()
+                        .persistent()
+                        .set(&DataKey::IndexByOwner(last_owner.clone()), &index);
+                    extend_owner_index_ttl(env, index, &last_owner);
+                }
+            }
+            env.storage()
+                .persistent()
+                .remove(&DataKey::OwnerByIndex(last_index));
+            env.storage()
+                .persistent()
+                .remove(&DataKey::IndexByOwner(owner.clone()));
+            set_owner_count(env, last_index);
+            env.storage().instance().set(&DataKey::TotalNgos, &last_index);
+        }
+    }
 
     Ok(())
 }
@@ -513,47 +569,64 @@ impl NgoRegistry {
             return Err(Error::AlreadyVerified);
         }
 
-        env.storage().persistent().remove(&key);
-
-        // Remove from index using swap-and-pop to maintain a dense [0..count) index
-        if let Some(index) = env
-            .storage()
-            .persistent()
-            .get::<_, u32>(&DataKey::IndexByOwner(owner.clone()))
-        {
-            let count = get_owner_count(&env);
-            if count > 0 {
-                let last_index = count - 1;
-                if index != last_index {
-                    if let Some(last_owner) = env
-                        .storage()
-                        .persistent()
-                        .get::<_, Address>(&DataKey::OwnerByIndex(last_index))
-                    {
-                        env.storage()
-                            .persistent()
-                            .set(&DataKey::OwnerByIndex(index), &last_owner);
-                        env.storage()
-                            .persistent()
-                            .set(&DataKey::IndexByOwner(last_owner.clone()), &index);
-                        extend_owner_index_ttl(&env, index, &last_owner);
-                    }
-                }
-                env.storage()
-                    .persistent()
-                    .remove(&DataKey::OwnerByIndex(last_index));
-                env.storage()
-                    .persistent()
-                    .remove(&DataKey::IndexByOwner(owner.clone()));
-                set_owner_count(&env, last_index);
-                env.storage()
-                    .instance()
-                    .set(&DataKey::TotalNgos, &last_index);
-            }
-        }
+        delete_ngo_entry(&env, &owner)?;
 
         extend_instance_ttl(&env);
         UnregisteredEvent { owner, data: () }.publish(&env);
+
+        Ok(())
+    }
+
+    /// Removes an unverified NGO entry entirely. Admin-only, so an admin can
+    /// clear out an impersonating or abusive application without waiting for
+    /// its owner to `unregister`. Returns `Error::NotRegistered` for an
+    /// address with no entry and `Error::AlreadyVerified` for a verified one:
+    /// an approval is undone with `revoke_ngo` first, so removal can never
+    /// silently drop a verification an admin granted.
+    ///
+    /// The entry, its position in the owners index, and the live counts
+    /// (`TotalNgos`/`OwnerIndexCount`) are all cleared, so the owner can
+    /// register again. The lifetime `NgoCount` is left alone, matching
+    /// `unregister`.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// # use soroban_sdk::{testutils::Address as _, Address, Env, String};
+    /// # use ngo_registry::{NgoRegistry, NgoRegistryArgs, NgoRegistryClient};
+    /// # let env = Env::default();
+    /// # env.mock_all_auths();
+    /// # let admin = Address::generate(&env);
+    /// # let contract_id = env.register(NgoRegistry, NgoRegistryArgs::__constructor(&admin));
+    /// # let client = NgoRegistryClient::new(&env, &contract_id);
+    /// let spammer = Address::generate(&env);
+    /// client.register(&spammer, &String::from_str(&env, "Totally Real Charity"));
+    ///
+    /// // The admin removes the junk application outright.
+    /// client.remove_ngo(&spammer);
+    /// assert!(client.try_get_ngo(&spammer).is_err());
+    /// ```
+    pub fn remove_ngo(env: Env, ngo_owner: Address) -> Result<(), Error> {
+        require_admin(&env)?;
+
+        let key = DataKey::Ngo(ngo_owner.clone());
+        let ngo: Ngo = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(Error::NotRegistered)?;
+        if ngo.verified {
+            return Err(Error::AlreadyVerified);
+        }
+
+        delete_ngo_entry(&env, &ngo_owner)?;
+
+        extend_instance_ttl(&env);
+        RemovedEvent {
+            owner: ngo_owner,
+            data: (),
+        }
+        .publish(&env);
 
         Ok(())
     }
