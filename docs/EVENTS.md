@@ -263,9 +263,22 @@ contract.
 | Topics | `("regset",)` |
 | Data | `registry: Address` (the new registry address) |
 
-Once set, `create_stream` verifies the NGO against this registry; there is no
-entry point that clears the registry back to `None`, so this event only ever
-moves the vault to a new registry address.
+Once set, `create_stream` verifies the NGO against this registry. To clear the
+registry pointer back to `None`, the admin calls `clear_registry` (emitting `regclr`).
+
+### `regclr`
+
+Emitted by `clear_registry` when an admin clears the configured NGO registry contract.
+
+| | |
+|---|---|
+| Topics | `("regclr",)` |
+| Data | `()` |
+
+Clearing the registry removes the stored registry address (`registry()` returns `None`),
+so subsequent `create_stream` calls accept any recipient address without registry
+verification.
+
 
 ### `upgrade`
 

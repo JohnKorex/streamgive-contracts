@@ -145,6 +145,11 @@ pub struct RegistrySetEvent {
     pub registry: Address,
 }
 
+#[contractevent(topics = ["regclr"], data_format = "single-value")]
+pub struct RegistryClearedEvent {
+    pub data: (),
+}
+
 #[contractevent(topics = ["init"], data_format = "single-value")]
 pub struct InitializedEvent {
     pub admin: Address,
@@ -1671,8 +1676,10 @@ impl DonationVault {
             .unwrap_or(DEFAULT_MAX_STREAMS_PER_DONOR)
     }
 
-    /// Sets (or clears) the NGO registry contract used to verify NGOs
-    /// before a stream is opened. Admin-gated.
+    /// Sets the NGO registry contract used to verify NGOs before a stream
+    /// is opened. Admin-gated.
+    ///
+    /// To clear an existing registry, use [`clear_registry`](Self::clear_registry).
     ///
     /// # Examples
     ///
@@ -1695,6 +1702,46 @@ impl DonationVault {
         extend_instance_ttl(&env);
 
         RegistrySetEvent { registry }.publish(&env);
+
+        Ok(())
+    }
+
+    /// Clears the configured NGO registry address, disabling registry verification
+    /// for subsequent streams. Admin-gated.
+    ///
+    /// # Trade-off
+    ///
+    /// Clearing the registry turns off NGO verification for all new streams opened
+    /// while the registry is unset — any recipient address (as long as it differs from
+    /// the donor) will be accepted. Use `set_registry` to configure a new registry.
+    ///
+    /// If no registry was set, this is an idempotent no-op (mirroring `clear_treasury`),
+    /// removing the key if present, extending instance TTL, and publishing the `regclr` event.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// # use soroban_sdk::{testutils::Address as _, Address, Env};
+    /// # use donation_vault::{DonationVault, DonationVaultClient};
+    /// # let env = Env::default();
+    /// # env.mock_all_auths();
+    /// # let contract_id = env.register(DonationVault, ());
+    /// # let client = DonationVaultClient::new(&env, &contract_id);
+    /// # let admin = Address::generate(&env);
+    /// # client.init(&admin);
+    /// let registry = Address::generate(&env);
+    /// client.set_registry(&registry);
+    /// assert_eq!(client.registry(), Some(registry));
+    ///
+    /// client.clear_registry();
+    /// assert_eq!(client.registry(), None);
+    /// ```
+    pub fn clear_registry(env: Env) -> Result<(), Error> {
+        require_admin(&env)?;
+        env.storage().instance().remove(&DataKey::Registry);
+        extend_instance_ttl(&env);
+
+        RegistryClearedEvent { data: () }.publish(&env);
 
         Ok(())
     }

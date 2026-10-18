@@ -3755,6 +3755,133 @@ fn create_stream_skips_verification_when_no_registry_configured() {
     assert_eq!(s.client.get_stream(&stream_id).balance, 1_000);
 }
 
+#[test]
+fn bad_registry_fails_create_stream_and_clear_registry_restores_creation() {
+    let s = setup();
+    s.token_admin.mint(&s.donor, &2_000);
+
+    // Set an invalid registry address (not a real contract)
+    let bad_registry = Address::generate(&s.env);
+    s.client.set_registry(&bad_registry);
+    assert_eq!(s.client.registry(), Some(bad_registry));
+
+    // create_stream attempts cross-contract call to bad address, fails closed with NgoNotVerified
+    let result = s
+        .client
+        .try_create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+    assert_eq!(result, Err(Ok(Error::NgoNotVerified)));
+
+    // Admin clears the bad registry
+    s.client.clear_registry();
+    assert_eq!(s.client.registry(), None);
+
+    // Now streams can be created again (skips verification)
+    let stream_id = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+    assert_eq!(s.client.get_stream(&stream_id).balance, 1_000);
+}
+
+#[test]
+fn clear_registry_requires_admin_auth() {
+    let s = setup();
+    let admin = s.client.admin();
+    let registry_addr = Address::generate(&s.env);
+    s.client.set_registry(&registry_addr);
+
+    s.client.clear_registry();
+    assert_auth_required_from(&s, &admin, "clear_registry");
+}
+
+#[test]
+fn clear_registry_rejects_non_admin_and_preserves_registry() {
+    let s = setup();
+    let registry_addr = Address::generate(&s.env);
+    s.client.set_registry(&registry_addr);
+
+    let non_admin = Address::generate(&s.env);
+    s.env.mock_auths(&[MockAuth {
+        address: &non_admin,
+        invoke: &MockAuthInvoke {
+            contract: &s.client.address,
+            fn_name: "clear_registry",
+            args: ().into_val(&s.env),
+            sub_invokes: &[],
+        },
+    }]);
+
+    let result = s.client.try_clear_registry();
+    assert!(result.is_err());
+    assert_eq!(s.client.registry(), Some(registry_addr));
+}
+
+#[test]
+fn clear_registry_on_already_unset_registry_is_idempotent() {
+    let s = setup();
+    assert_eq!(s.client.registry(), None);
+
+    let result = s.client.try_clear_registry();
+    assert_eq!(result, Ok(Ok(())));
+    assert_eq!(s.client.registry(), None);
+}
+
+#[test]
+fn clear_registry_emits_event() {
+    let s = setup();
+    let registry_addr = Address::generate(&s.env);
+    s.client.set_registry(&registry_addr);
+
+    s.client.clear_registry();
+    let event = last_event(&s.env);
+
+    assert_eq!(
+        event,
+        (
+            (symbol_short!("regclr"),).into_val(&s.env),
+            ().into_val(&s.env),
+        )
+    );
+}
+
+#[test]
+fn valid_registry_can_be_set_again_after_clearing() {
+    let s = setup();
+    s.token_admin.mint(&s.donor, &2_000);
+
+    let admin = s.client.admin();
+    let registry_id = s.env.register(
+        ngo_registry::NgoRegistry,
+        ngo_registry::NgoRegistryArgs::__constructor(&admin),
+    );
+    let registry_client = ngo_registry::NgoRegistryClient::new(&s.env, &registry_id);
+
+    // Set registry
+    s.client.set_registry(&registry_id);
+    assert_eq!(s.client.registry(), Some(registry_id.clone()));
+
+    // Clear registry
+    s.client.clear_registry();
+    assert_eq!(s.client.registry(), None);
+
+    // Re-set valid registry
+    s.client.set_registry(&registry_id);
+    assert_eq!(s.client.registry(), Some(registry_id.clone()));
+
+    // Unverified NGO fails
+    let result = s
+        .client
+        .try_create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+    assert_eq!(result, Err(Ok(Error::NgoNotVerified)));
+
+    // Approve NGO and succeed
+    registry_client.register(&s.ngo, &soroban_sdk::String::from_str(&s.env, "Red Cross"));
+    registry_client.approve_ngo(&s.ngo);
+    let stream_id = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+    assert_eq!(s.client.get_stream(&stream_id).balance, 1_000);
+}
+
 // =============================================================================
 // withdraw_batch tests (issue #285)
 // =============================================================================
