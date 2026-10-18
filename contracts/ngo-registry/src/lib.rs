@@ -89,7 +89,8 @@ pub enum DataKey {
     Admin,
     /// The administrator nominated to take over, pending acceptance.
     PendingAdmin,
-    /// Running total of registered NGOs (a `u32`, seeded from `NgoCount`).
+    /// Unused and reserved. Preserved to maintain enum discriminant stability
+    /// for existing deployed contracts. Callers should read `NgoCount` via `ngo_count()`.
     TotalNgos,
     /// The registry record keyed by an NGO owner's address.
     Ngo(Address),
@@ -113,7 +114,7 @@ pub enum Error {
     NotRegistered = 4,
     /// The NGO has already been approved, so its name is locked.
     AlreadyVerified = 5,
-    /// `name` is longer than `MAX_NGO_NAME_LEN`.
+    /// `name` is longer than `MAX_NGO_NAME_LEN` (200 bytes).
     NameTooLong = 6,
     /// `revoke_ngo` was called on an NGO that isn't currently verified.
     /// The NGO has not been approved, so it cannot be revoked.
@@ -124,7 +125,8 @@ pub enum Error {
     /// The proposed administrator is not a valid replacement.
     InvalidAdmin = 9,
     ArithmeticOverflow = 10,
-    /// The supplied name is empty or contains only ASCII whitespace.
+    /// The supplied name is empty, contains only Unicode whitespace or invisible
+    /// format characters, contains control characters, or is invalid UTF-8.
     InvalidName = 11,
 }
 
@@ -132,7 +134,8 @@ pub enum Error {
 /// what's stored, so without a cap a registration could inflate its own
 /// entry's storage footprint indefinitely. Comfortably fits a real
 /// organization name while keeping a single entry's storage bounded.
-const MAX_NGO_NAME_LEN: u32 = 200;
+/// Note: this is strictly a byte limit (200 bytes), not a character limit.
+pub const MAX_NGO_NAME_LEN: u32 = 200;
 
 /// Maximum number of NGO owners returned by `list_ngos` in a single page.
 /// Caps read footprint, memory, and gas consumption to keep pagination bounded.
@@ -189,12 +192,75 @@ fn set_owner_count(env: &Env, count: u32) {
         .set(&DataKey::OwnerIndexCount, &count);
 }
 
-fn is_whitespace_only(name: &String) -> bool {
+/// Returns whether a code point is an invisible or format character (category Cf).
+///
+/// Deliberately limited to zero-width spaces, joiners, word joiners, soft hyphens,
+/// and byte order marks. These are treated as invisible (whitespace-like) for the
+/// emptiness check: a name consisting solely of these characters and/or Unicode whitespace
+/// is rejected. When present alongside visible characters, they are permitted (e.g.
+/// for complex script ligatures).
+/// Note: bidirectional override characters (such as U+202E) are not handled here and
+/// should be tracked as a follow-up spoofing consideration.
+fn is_invisible_format(c: char) -> bool {
+    matches!(
+        c,
+        '\u{200B}' // Zero Width Space
+        | '\u{200C}' // Zero Width Non-Joiner
+        | '\u{200D}' // Zero Width Joiner
+        | '\u{2060}' // Word Joiner
+        | '\u{FEFF}' // Zero Width No-Break Space (BOM)
+        | '\u{00AD}' // Soft Hyphen
+        | '\u{200E}' // Left-to-Right Mark
+        | '\u{200F}' // Right-to-Left Mark
+    )
+}
+
+/// Validates a raw byte slice as an NGO name.
+///
+/// Rejects names longer than `MAX_NGO_NAME_LEN` (200 bytes) with `Error::NameTooLong`.
+/// Rejects names that are empty, invalid UTF-8, contain any control character
+/// (Unicode category Cc), or consist solely of Unicode whitespace and/or invisible
+/// format characters with `Error::InvalidName`.
+pub(crate) fn validate_name_bytes(bytes: &[u8]) -> Result<(), Error> {
+    if bytes.len() > MAX_NGO_NAME_LEN as usize {
+        return Err(Error::NameTooLong);
+    }
+    if bytes.is_empty() {
+        return Err(Error::InvalidName);
+    }
+    let s = core::str::from_utf8(bytes).map_err(|_| Error::InvalidName)?;
+    let mut has_visible = false;
+    for c in s.chars() {
+        if c.is_control() {
+            return Err(Error::InvalidName);
+        }
+        if c.is_whitespace() || is_invisible_format(c) {
+            continue;
+        }
+        has_visible = true;
+    }
+    if !has_visible {
+        return Err(Error::InvalidName);
+    }
+    Ok(())
+}
+
+/// Validates an NGO name in Soroban SDK `String` format.
+///
+/// Copies into a stack buffer bounded by `MAX_NGO_NAME_LEN` (200 bytes)
+/// without heap allocations. Replaces `is_whitespace_only`.
+fn validate_name(name: &String) -> Result<(), Error> {
+    if name.len() > MAX_NGO_NAME_LEN {
+        return Err(Error::NameTooLong);
+    }
+    if name.is_empty() {
+        return Err(Error::InvalidName);
+    }
+    let len = name.len() as usize;
+    let mut buf = [0u8; MAX_NGO_NAME_LEN as usize];
     let bytes: Bytes = name.into();
-    bytes.is_empty()
-        || bytes
-            .iter()
-            .all(|byte| matches!(byte, b' ' | b'\t' | b'\n' | b'\r' | b'\x0b' | b'\x0c'))
+    bytes.copy_into_slice(&mut buf[..len]);
+    validate_name_bytes(&buf[..len])
 }
 
 /// Reads the configured admin and requires their auth, failing with
@@ -244,12 +310,23 @@ fn approve_registered_ngo(env: &Env, ngo_owner: Address) -> Result<(), Error> {
 /// shrinking the live counts. Shared by `unregister` (owner-initiated) and
 /// `remove_ngo` (admin-initiated); the caller is responsible for authorizing
 /// the call and for the verified/unverified check. Does not touch the
-/// instance TTL — the caller decides whether to bump it — and does not
-/// decrement `NgoCount`, which is a lifetime registration counter.
+/// instance TTL — the caller decides whether to bump it. Decrements `NgoCount`
+/// using checked subtraction, returning `Error::ArithmeticOverflow` on underflow.
 fn delete_ngo_entry(env: &Env, owner: &Address) -> Result<(), Error> {
+    let count: u64 = env
+        .storage()
+        .instance()
+        .get(&DataKey::NgoCount)
+        .unwrap_or(0);
+    let new_ngo_count = count.checked_sub(1).ok_or(Error::ArithmeticOverflow)?;
+
     env.storage()
         .persistent()
         .remove(&DataKey::Ngo(owner.clone()));
+
+    env.storage()
+        .instance()
+        .set(&DataKey::NgoCount, &new_ngo_count);
 
     // Remove from index using swap-and-pop to maintain a dense [0..count) index
     if let Some(index) = env
@@ -282,7 +359,6 @@ fn delete_ngo_entry(env: &Env, owner: &Address) -> Result<(), Error> {
                 .persistent()
                 .remove(&DataKey::IndexByOwner(owner.clone()));
             set_owner_count(env, last_index);
-            env.storage().instance().set(&DataKey::TotalNgos, &last_index);
         }
     }
 
@@ -480,8 +556,10 @@ impl NgoRegistry {
     }
 
     /// Submits an NGO application. Callable by the NGO's own address.
-    /// The entry starts unverified until an admin approves it. Names that
-    /// are empty or contain only ASCII whitespace return `Error::InvalidName`.
+    /// The entry starts unverified until an admin approves it. Names must be
+    /// at most 200 bytes (`MAX_NGO_NAME_LEN`), valid UTF-8, contain at least one visible
+    /// character (not empty or made only of Unicode whitespace or invisible format characters),
+    /// and contain no control characters. Names are not trimmed.
     ///
     /// # Examples
     ///
@@ -505,17 +583,22 @@ impl NgoRegistry {
     pub fn register(env: Env, owner: Address, name: String) -> Result<(), Error> {
         owner.require_auth();
 
-        if is_whitespace_only(&name) {
-            return Err(Error::InvalidName);
-        }
-        if name.len() > MAX_NGO_NAME_LEN {
-            return Err(Error::NameTooLong);
-        }
+        validate_name(&name)?;
 
         let key = DataKey::Ngo(owner.clone());
         if env.storage().persistent().has(&key) {
             return Err(Error::AlreadyRegistered);
         }
+
+        let count: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::NgoCount)
+            .unwrap_or(0);
+        let new_ngo_count = count.checked_add(1).ok_or(Error::ArithmeticOverflow)?;
+
+        let index = get_owner_count(&env);
+        let new_count = index.checked_add(1).ok_or(Error::ArithmeticOverflow)?;
 
         let ngo = Ngo {
             owner: owner.clone(),
@@ -524,28 +607,18 @@ impl NgoRegistry {
         };
         env.storage().persistent().set(&key, &ngo);
 
-        let count: u64 = env
-            .storage()
-            .instance()
-            .get(&DataKey::NgoCount)
-            .unwrap_or(0);
         env.storage()
             .instance()
-            .set(&DataKey::NgoCount, &(count + 1));
+            .set(&DataKey::NgoCount, &new_ngo_count);
 
         // Maintain the registered owners index
-        let index = get_owner_count(&env);
         env.storage()
             .persistent()
             .set(&DataKey::OwnerByIndex(index), &owner);
         env.storage()
             .persistent()
             .set(&DataKey::IndexByOwner(owner.clone()), &index);
-        let new_count = index.checked_add(1).ok_or(Error::ArithmeticOverflow)?;
         set_owner_count(&env, new_count);
-        env.storage()
-            .instance()
-            .set(&DataKey::TotalNgos, &new_count);
 
         extend_instance_ttl(&env);
         extend_ngo_ttl(&env, &owner);
@@ -556,12 +629,16 @@ impl NgoRegistry {
         Ok(())
     }
 
-    /// Returns the number of successfully registered NGOs.
+    /// Deprecated alias of [`ngo_count`](Self::ngo_count).
+    ///
+    /// Reads the same single stored counter (`NgoCount`) as `ngo_count()`.
+    /// Preserved for backwards compatibility with existing callers.
+    ///
+    /// # Conversion
+    /// Returns the live count as `u32`. If the stored `u64` count exceeds
+    /// `u32::MAX`, saturates at `u32::MAX`. Callers should prefer [`ngo_count`](Self::ngo_count).
     pub fn total_ngos(env: Env) -> u32 {
-        env.storage()
-            .instance()
-            .get(&DataKey::TotalNgos)
-            .unwrap_or(0)
+        u32::try_from(Self::ngo_count(env)).unwrap_or(u32::MAX)
     }
 
     /// Removes the caller's unverified NGO application.
@@ -702,6 +779,9 @@ impl NgoRegistry {
     /// no entry, and `Error::AlreadyVerified` once an admin has approved
     /// it — the name an admin approved is the name that stays.
     ///
+    /// The new name must meet the same validation rules as in `register`: at most
+    /// 200 bytes, valid UTF-8, at least one visible character, and no control characters.
+    ///
     /// # Examples
     ///
     /// ```rust,no_run
@@ -723,9 +803,7 @@ impl NgoRegistry {
     pub fn update_name(env: Env, owner: Address, name: String) -> Result<(), Error> {
         owner.require_auth();
 
-        if name.len() > MAX_NGO_NAME_LEN {
-            return Err(Error::NameTooLong);
-        }
+        validate_name(&name)?;
 
         let key = DataKey::Ngo(owner.clone());
         let mut ngo: Ngo = env
@@ -737,10 +815,6 @@ impl NgoRegistry {
             return Err(Error::AlreadyVerified);
         }
 
-// Validate name whitespace
-        if is_whitespace_only(&name) {
-            return Err(Error::InvalidName);
-        }
         // Only update and emit event if the name actually changes
         if ngo.name != name {
             ngo.name = name.clone();

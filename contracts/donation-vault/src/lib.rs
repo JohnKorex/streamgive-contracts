@@ -459,6 +459,28 @@ fn require_not_paused(env: &Env) -> Result<(), Error> {
     Ok(())
 }
 
+/// If an NGO registry is configured, verifies that `ngo` is approved/verified.
+/// If no registry is configured, verification is skipped and this returns `Ok(())`.
+/// Returns `Error::NgoNotVerified` if the NGO is unverified, unregistered, revoked,
+/// or if the registry cross-contract call fails.
+fn require_verified_ngo(env: &Env, ngo: &Address) -> Result<(), Error> {
+    if let Some(registry_addr) = env
+        .storage()
+        .instance()
+        .get::<_, Address>(&DataKey::Registry)
+    {
+        let registry = NgoRegistryClient::new(env, &registry_addr);
+        let ngo_entry = registry
+            .try_get_ngo(ngo)
+            .map_err(|_| Error::NgoNotVerified)?
+            .map_err(|_| Error::NgoNotVerified)?;
+        if !ngo_entry.verified {
+            return Err(Error::NgoNotVerified);
+        }
+    }
+    Ok(())
+}
+
 /// Moves `amount` from a stream's `balance` into its `withdrawn` total,
 /// failing with `Error::ArithmeticOverflow` rather than panicking if
 /// either would leave i128's range.
@@ -1835,20 +1857,7 @@ impl DonationVault {
 
         // If a registry has been configured, verify the NGO is approved before
         // pulling any funds from the donor.
-        if let Some(registry_addr) = env
-            .storage()
-            .instance()
-            .get::<_, Address>(&DataKey::Registry)
-        {
-            let registry = NgoRegistryClient::new(&env, &registry_addr);
-            let ngo_entry = registry
-                .try_get_ngo(&ngo)
-                .map_err(|_| Error::NgoNotVerified)?
-                .map_err(|_| Error::NgoNotVerified)?;
-            if !ngo_entry.verified {
-                return Err(Error::NgoNotVerified);
-            }
-        }
+        require_verified_ngo(&env, &ngo)?;
 
         let total_donated: i128 = env
             .storage()
@@ -2388,6 +2397,15 @@ impl DonationVault {
     /// `Error::StreamCancelled` if `cancel_stream` has already closed the
     /// stream out.
     ///
+    /// If an NGO registry is configured, re-verifies that the stream's NGO
+    /// is approved and active in the registry. If the NGO has been revoked,
+    /// fails with `Error::NgoNotVerified` before settling, modifying balances,
+    /// or pulling funds.
+    ///
+    /// Existing funds in a stream whose NGO was revoked remain protected:
+    /// the NGO may still withdraw already-accrued funds, and the donor can
+    /// still cancel the stream to receive a refund of unaccrued funds.
+    ///
     /// # Examples
     ///
     /// ```rust,no_run
@@ -2433,6 +2451,10 @@ impl DonationVault {
         if stream.cancelled {
             return Err(Error::StreamCancelled);
         }
+
+        // Re-check that the NGO is still verified in the registry before
+        // settling, updating state, or transferring new funds.
+        require_verified_ngo(&env, &stream.ngo)?;
 
         let token_client = token::Client::new(&env, &stream.token);
 
@@ -2580,20 +2602,7 @@ impl DonationVault {
             return Ok(());
         }
 
-        if let Some(registry_addr) = env
-            .storage()
-            .instance()
-            .get::<_, Address>(&DataKey::Registry)
-        {
-            let registry = NgoRegistryClient::new(&env, &registry_addr);
-            let ngo_entry = registry
-                .try_get_ngo(&new_ngo)
-                .map_err(|_| Error::NgoNotVerified)?
-                .map_err(|_| Error::NgoNotVerified)?;
-            if !ngo_entry.verified {
-                return Err(Error::NgoNotVerified);
-            }
-        }
+        require_verified_ngo(&env, &new_ngo)?;
 
         let old_ngo = stream.ngo.clone();
         let now = env.ledger().timestamp();
