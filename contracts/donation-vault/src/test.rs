@@ -3048,6 +3048,108 @@ fn transfer_stream_bumps_instance_and_stream_ttl() {
 }
 
 #[test]
+fn transfer_stream_rejects_unauthorized_caller() {
+    let s = setup();
+    s.token_admin.mint(&s.donor, &1_000);
+    let new_ngo = Address::generate(&s.env);
+
+    let stream_id = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+
+    let attacker = Address::generate(&s.env);
+    s.env.mock_auths(&[MockAuth {
+        address: &attacker,
+        invoke: &MockAuthInvoke {
+            contract: &s.client.address,
+            fn_name: "transfer_stream",
+            args: (stream_id, new_ngo.clone()).into_val(&s.env),
+            sub_invokes: &[],
+        },
+    }]);
+
+    let result = s.client.try_transfer_stream(&stream_id, &new_ngo);
+    assert!(result.is_err());
+}
+
+#[test]
+fn transfer_stream_rejects_self_stream() {
+    let s = setup();
+    s.token_admin.mint(&s.donor, &1_000);
+
+    let stream_id = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+
+    let result = s.client.try_transfer_stream(&stream_id, &s.donor);
+    assert_eq!(result, Err(Ok(Error::SelfStream)));
+}
+
+#[test]
+fn transfer_stream_to_same_ngo_is_noop() {
+    let s = setup();
+    s.token_admin.mint(&s.donor, &1_000);
+
+    let stream_id = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+
+    let result = s.client.try_transfer_stream(&stream_id, &s.ngo);
+    assert_eq!(result, Ok(Ok(())));
+    assert_eq!(s.client.get_stream(&stream_id).ngo, s.ngo);
+}
+
+#[test]
+fn transfer_stream_rejects_unverified_new_ngo_when_registry_configured() {
+    let (s, registry) = setup_with_registry();
+    s.token_admin.mint(&s.donor, &1_000);
+
+    registry.register(&s.ngo, &soroban_sdk::String::from_str(&s.env, "Old NGO"));
+    registry.approve_ngo(&s.ngo);
+
+    let stream_id = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+
+    let new_ngo = Address::generate(&s.env);
+    // new_ngo is not registered / approved in registry
+    let result = s.client.try_transfer_stream(&stream_id, &new_ngo);
+    assert_eq!(result, Err(Ok(Error::NgoNotVerified)));
+
+    // Now register and approve new_ngo
+    registry.register(&new_ngo, &soroban_sdk::String::from_str(&s.env, "New NGO"));
+    registry.approve_ngo(&new_ngo);
+    assert_eq!(s.client.try_transfer_stream(&stream_id, &new_ngo), Ok(Ok(())));
+    assert_eq!(s.client.get_stream(&stream_id).ngo, new_ngo);
+}
+
+#[test]
+fn transfer_stream_emits_event_with_settled_accrual() {
+    let s = setup();
+    s.token_admin.mint(&s.donor, &1_000);
+    let new_ngo = Address::generate(&s.env);
+
+    let stream_id = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+
+    // 50 seconds pass -> 500 settles to old NGO
+    s.env.ledger().with_mut(|l| l.timestamp += 50);
+
+    s.client.transfer_stream(&stream_id, &new_ngo);
+    let transferred = last_event(&s.env);
+
+    assert_eq!(
+        transferred,
+        (
+            (symbol_short!("transfer"), stream_id).into_val(&s.env),
+            (s.ngo.clone(), new_ngo.clone(), 500i128).into_val(&s.env),
+        )
+    );
+}
+
+
+#[test]
 fn double_init_fails_and_preserves_original_admin() {
     let s = setup();
     let admin = s.client.admin();

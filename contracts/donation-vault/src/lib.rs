@@ -2393,9 +2393,35 @@ impl DonationVault {
             return Err(Error::StreamCancelled);
         }
 
+        if new_ngo == stream.donor {
+            return Err(Error::SelfStream);
+        }
+
+        if new_ngo == stream.ngo {
+            return Ok(());
+        }
+
+        if let Some(registry_addr) = env
+            .storage()
+            .instance()
+            .get::<_, Address>(&DataKey::Registry)
+        {
+            let registry = NgoRegistryClient::new(&env, &registry_addr);
+            let ngo_entry = registry
+                .try_get_ngo(&new_ngo)
+                .map_err(|_| Error::NgoNotVerified)?
+                .map_err(|_| Error::NgoNotVerified)?;
+            if !ngo_entry.verified {
+                return Err(Error::NgoNotVerified);
+            }
+        }
+
         let old_ngo = stream.ngo.clone();
         let now = env.ledger().timestamp();
         let settled = settle(&env, &mut stream, now)?;
+        if stream.balance == 0 {
+            stream.status = StreamStatus::Drained;
+        }
         stream.ngo = new_ngo.clone();
 
         env.storage().persistent().set(&key, &stream);
