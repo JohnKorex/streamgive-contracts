@@ -1839,14 +1839,6 @@ impl DonationVault {
             }
         }
 
-        // The most the NGO can draw in the first second is `rate`, capped by
-        // the deposit. If the fee would swallow all of it, the stream could
-        // never pay the NGO anything, so refuse it up front.
-        let first_payout = rate.min(deposit);
-        if first_payout - compute_fee(&env, &token, first_payout) <= 0 {
-            return Err(Error::InvalidAmount);
-        }
-
         let total_donated: i128 = env
             .storage()
             .instance()
@@ -2009,10 +2001,11 @@ impl DonationVault {
     /// once. Streams that have accrued nothing since their last checkpoint
     /// are skipped so an NGO can pass its full stream list without filtering
     /// it first; a stream id that doesn't exist (or an arithmetic overflow)
-    /// aborts the whole batch atomically. The protocol fee is skimmed from
-    /// the aggregated per-token amount, not per stream.
+    /// aborts the whole batch atomically. The protocol fee is computed per
+    /// stream (matching `withdraw` and `pending_payout`), then the net amounts
+    /// are aggregated per token for transfer.
     ///
-    /// Returns the gross accrued amount for each input stream, in the same
+    /// Returns the net payout for each input stream, in the same
     /// order as `stream_ids` (0 for a stream that had nothing to withdraw).
     ///
     /// # Examples
@@ -2049,8 +2042,9 @@ impl DonationVault {
 
         let now = env.ledger().timestamp();
         let mut ngo: Option<Address> = None;
-        let mut amounts: Vec<i128> = Vec::new(&env);
-        let mut payouts: Map<Address, i128> = Map::new(&env);
+        let mut net_amounts: Vec<i128> = Vec::new(&env);
+        let mut net_payouts: Map<Address, i128> = Map::new(&env);
+        let mut fee_payouts: Map<Address, i128> = Map::new(&env);
 
         for stream_id in stream_ids.iter() {
             let key = DataKey::Stream(stream_id);
@@ -2076,7 +2070,14 @@ impl DonationVault {
 
             let elapsed = now.saturating_sub(stream.last_update);
             let accrued = math::accrued(stream.rate, elapsed, stream.balance);
-            amounts.push_back(accrued);
+            
+            let fee = if accrued > 0 {
+                compute_fee(&env, &stream.token, accrued)
+            } else {
+                0
+            };
+            let net = accrued.checked_sub(fee).unwrap_or(0);
+            net_amounts.push_back(net);
 
             if accrued <= 0 {
                 continue;
@@ -2087,52 +2088,88 @@ impl DonationVault {
             env.storage().persistent().set(&key, &stream);
             extend_stream_ttl(&env, stream_id);
 
-            let total = payouts.get(stream.token.clone()).unwrap_or(0);
-            payouts.set(
+            // Accumulate net amounts per token
+            let net_total = net_payouts.get(stream.token.clone()).unwrap_or(0);
+            net_payouts.set(
                 stream.token.clone(),
-                total
-                    .checked_add(accrued)
+                net_total
+                    .checked_add(net)
                     .ok_or(Error::ArithmeticOverflow)?,
             );
+
+            // Accumulate fees per token
+            if fee > 0 {
+                let fee_total = fee_payouts.get(stream.token.clone()).unwrap_or(0);
+                fee_payouts.set(
+                    stream.token.clone(),
+                    fee_total
+                        .checked_add(fee)
+                        .ok_or(Error::ArithmeticOverflow)?,
+                );
+            }
         }
 
         if let Some(ngo) = ngo {
             extend_instance_ttl(&env);
 
-            // One transfer (and at most one fee transfer) per token, rather
-            // than one per stream.
-            for (token, gross) in payouts.iter() {
-                let token_client = token::Client::new(&env, &token);
-                pay_ngo(&env, &token_client, &ngo, gross);
+            // One net transfer per token to NGO
+            for (token, net_total) in net_payouts.iter() {
+                if net_total > 0 {
+                    let token_client = token::Client::new(&env, &token);
+                    token_client.transfer(&env.current_contract_address(), &ngo, &net_total);
+                }
+            }
+
+            // One fee transfer per token to treasury
+            let treasury: Option<Address> = env.storage().instance().get(&DataKey::Treasury);
+            if let Some(treasury_address) = treasury {
+                for (token, fee_total) in fee_payouts.iter() {
+                    if fee_total > 0 {
+                        let token_client = token::Client::new(&env, &token);
+                        token_client.transfer(&env.current_contract_address(), &treasury_address, &fee_total);
+                    }
+                }
             }
         }
 
         // Emit a `withdraw` per contributing stream, matching `withdraw`'s
         // topics and data so the indexer needs no batch-specific handling.
-        for (stream_id, accrued) in stream_ids.iter().zip(amounts.iter()) {
-            if accrued > 0 {
+        let mut idx = 0;
+        for stream_id in stream_ids.iter() {
+            let net = net_amounts.get(idx).unwrap_or(0);
+            idx += 1;
+            
+            if net > 0 {
                 let stream_key = DataKey::Stream(stream_id);
-                let fee = if let Some(st) = env
+                if let Some(st) = env
                     .storage()
                     .persistent()
                     .get::<DataKey, Stream>(&stream_key)
                 {
-                    compute_fee(&env, &st.token, accrued)
-                } else {
-                    0
-                };
-                let net = accrued.checked_sub(fee).unwrap_or(0);
-                WithdrawnEvent {
-                    stream_id,
-                    accrued,
-                    fee,
-                    net,
+                    // Recompute accrued from the updated stream state
+                    let prev_withdrawn = st.withdrawn
+                        .checked_sub(net)
+                        .and_then(|w| {
+                            let fee = compute_fee(&env, &st.token, net);
+                            w.checked_sub(fee)
+                        })
+                        .unwrap_or(st.withdrawn);
+                    
+                    let accrued = st.withdrawn.checked_sub(prev_withdrawn).unwrap_or(0);
+                    let fee = accrued.checked_sub(net).unwrap_or(0);
+                    
+                    WithdrawnEvent {
+                        stream_id,
+                        accrued,
+                        fee,
+                        net,
+                    }
+                    .publish(&env);
                 }
-                .publish(&env);
             }
         }
 
-        Ok(amounts)
+        Ok(net_amounts)
     }
 
     /// Stops a stream for good: settles whatever has already accrued to the
