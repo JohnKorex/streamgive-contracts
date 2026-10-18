@@ -3893,6 +3893,143 @@ fn valid_registry_can_be_set_again_after_clearing() {
     assert_eq!(s.client.get_stream(&stream_id).balance, 1_000);
 }
 
+#[test]
+fn top_up_to_verified_ngo_works_with_registry_configured() {
+    let (s, registry) = setup_with_registry();
+    s.token_admin.mint(&s.donor, &3_000);
+
+    registry.register(&s.ngo, &soroban_sdk::String::from_str(&s.env, "Red Cross"));
+    registry.approve_ngo(&s.ngo);
+
+    let stream_id = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+
+    s.client.top_up(&stream_id, &500);
+    assert_eq!(s.client.get_stream(&stream_id).balance, 1_500);
+    assert_eq!(s.token.balance(&s.donor), 1_500);
+}
+
+#[test]
+fn top_up_after_revocation_fails_and_preserves_state() {
+    let (s, registry) = setup_with_registry();
+    s.token_admin.mint(&s.donor, &3_000);
+
+    registry.register(&s.ngo, &soroban_sdk::String::from_str(&s.env, "Red Cross"));
+    registry.approve_ngo(&s.ngo);
+
+    let stream_id = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+
+    // Revoke the NGO
+    registry.revoke_ngo(&s.ngo);
+
+    let donor_balance_before = s.token.balance(&s.donor);
+    let stream_balance_before = s.client.get_stream(&stream_id).balance;
+    let total_donated_before = s.client.get_config().total_donated;
+
+    // Top up fails with exact Error::NgoNotVerified
+    let result = s.client.try_top_up(&stream_id, &500);
+    assert_eq!(result, Err(Ok(Error::NgoNotVerified)));
+
+    // State, balances, and totals are unchanged
+    assert_eq!(s.token.balance(&s.donor), donor_balance_before);
+    assert_eq!(s.client.get_stream(&stream_id).balance, stream_balance_before);
+    assert_eq!(s.client.get_config().total_donated, total_donated_before);
+}
+
+#[test]
+fn top_up_with_no_registry_configured_works_as_before() {
+    let s = setup();
+    s.token_admin.mint(&s.donor, &3_000);
+
+    assert_eq!(s.client.registry(), None);
+    let stream_id = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+
+    s.client.top_up(&stream_id, &500);
+    assert_eq!(s.client.get_stream(&stream_id).balance, 1_500);
+}
+
+#[test]
+fn top_up_after_re_verification_succeeds() {
+    let (s, registry) = setup_with_registry();
+    s.token_admin.mint(&s.donor, &3_000);
+
+    registry.register(&s.ngo, &soroban_sdk::String::from_str(&s.env, "Red Cross"));
+    registry.approve_ngo(&s.ngo);
+
+    let stream_id = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+
+    // Revoke and verify top_up fails
+    registry.revoke_ngo(&s.ngo);
+    assert_eq!(s.client.try_top_up(&stream_id, &500), Err(Ok(Error::NgoNotVerified)));
+
+    // Re-verify the NGO
+    registry.approve_ngo(&s.ngo);
+
+    // Top up now succeeds
+    s.client.top_up(&stream_id, &500);
+    assert_eq!(s.client.get_stream(&stream_id).balance, 1_500);
+    assert_eq!(s.token.balance(&s.donor), 1_500);
+}
+
+#[test]
+fn cancel_and_withdraw_still_work_for_stream_whose_ngo_was_revoked() {
+    let (s, registry) = setup_with_registry();
+    s.token_admin.mint(&s.donor, &2_000);
+
+    registry.register(&s.ngo, &soroban_sdk::String::from_str(&s.env, "Red Cross"));
+    registry.approve_ngo(&s.ngo);
+
+    let stream_id = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+
+    // Revoke NGO after stream opened
+    registry.revoke_ngo(&s.ngo);
+
+    // Advance 20 seconds: 20 * 10 = 200 accrued
+    s.env.ledger().with_mut(|l| l.timestamp += 20);
+
+    // NGO can still withdraw already accrued funds
+    s.client.withdraw(&stream_id, &200);
+    assert_eq!(s.token.balance(&s.ngo), 200);
+
+    // Donor can still cancel and receive refund of remaining 800 tokens
+    let refund = s.client.cancel_stream(&stream_id);
+    assert_eq!(refund, 800);
+    assert_eq!(s.token.balance(&s.donor), 1_800);
+    assert!(s.client.get_stream(&stream_id).cancelled);
+}
+
+#[test]
+fn bad_registry_fails_top_up_with_ngo_not_verified() {
+    let s = setup();
+    s.token_admin.mint(&s.donor, &3_000);
+
+    let stream_id = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+
+    // Point registry at an invalid address
+    let bad_registry = Address::generate(&s.env);
+    s.client.set_registry(&bad_registry);
+
+    // top_up attempts cross-contract call and fails closed with NgoNotVerified
+    let result = s.client.try_top_up(&stream_id, &500);
+    assert_eq!(result, Err(Ok(Error::NgoNotVerified)));
+
+    // Clearing registry allows top_up to proceed
+    s.client.clear_registry();
+    s.client.top_up(&stream_id, &500);
+    assert_eq!(s.client.get_stream(&stream_id).balance, 1_500);
+}
+
 // =============================================================================
 // withdraw_batch tests (issue #285)
 // =============================================================================
