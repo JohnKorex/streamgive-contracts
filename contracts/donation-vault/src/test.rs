@@ -1801,6 +1801,105 @@ fn get_stream_on_unknown_id_fails() {
 }
 
 #[test]
+fn get_streams_returns_mixed_existing_and_missing_ids() {
+    let s = setup();
+    s.token_admin.mint(&s.donor, &3_000);
+
+    let a = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+    let b = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &2_000, &20);
+
+    let mut ids = Vec::new(&s.env);
+    ids.push_back(a);
+    ids.push_back(999);
+    ids.push_back(b);
+
+    let streams = s.client.get_streams(&ids);
+
+    assert_eq!(streams.len(), 3);
+    assert_eq!(streams.get(0).unwrap().unwrap(), s.client.get_stream(&a));
+    assert_eq!(streams.get(1), Some(None));
+    assert_eq!(streams.get(2).unwrap().unwrap(), s.client.get_stream(&b));
+}
+
+#[test]
+fn get_streams_returns_none_for_every_missing_id() {
+    let s = setup();
+
+    let mut ids = Vec::new(&s.env);
+    ids.push_back(7);
+    ids.push_back(8);
+
+    let streams = s.client.get_streams(&ids);
+
+    assert_eq!(streams.len(), 2);
+    assert_eq!(streams.get(0), Some(None));
+    assert_eq!(streams.get(1), Some(None));
+}
+
+#[test]
+fn get_streams_with_no_ids_is_empty_and_takes_no_auth() {
+    let s = setup();
+    let ids: Vec<u64> = Vec::new(&s.env);
+
+    let streams = s.client.get_streams(&ids);
+
+    assert_eq!(streams.len(), 0);
+    assert!(s.env.auths().is_empty());
+}
+
+#[test]
+fn get_streams_preserves_order_and_duplicates() {
+    let s = setup();
+    s.token_admin.mint(&s.donor, &2_000);
+
+    let a = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+
+    let mut ids = Vec::new(&s.env);
+    ids.push_back(a);
+    ids.push_back(a);
+    ids.push_back(999);
+    ids.push_back(a);
+
+    let streams = s.client.get_streams(&ids);
+
+    assert_eq!(streams.len(), 4);
+    assert_eq!(streams.get(0).unwrap().unwrap(), s.client.get_stream(&a));
+    assert_eq!(streams.get(1).unwrap().unwrap(), s.client.get_stream(&a));
+    assert_eq!(streams.get(2), Some(None));
+    assert_eq!(streams.get(3).unwrap().unwrap(), s.client.get_stream(&a));
+}
+
+#[test]
+fn get_streams_at_exact_cap_succeeds() {
+    let s = setup();
+    let mut ids = Vec::new(&s.env);
+    for i in 0..MAX_BATCH_GET_STREAMS {
+        ids.push_back(i as u64);
+    }
+
+    let streams = s.client.get_streams(&ids);
+    assert_eq!(streams.len(), MAX_BATCH_GET_STREAMS);
+}
+
+#[test]
+fn get_streams_over_limit_fails_with_exact_error() {
+    let s = setup();
+    let mut ids = Vec::new(&s.env);
+    for i in 0..=MAX_BATCH_GET_STREAMS {
+        ids.push_back(i as u64);
+    }
+
+    let result = s.client.try_get_streams(&ids);
+    assert_eq!(result, Err(Ok(Error::BatchLimitExceeded)));
+}
+
+#[test]
 fn create_stream_stores_every_field() {
     let s = setup();
     s.token_admin.mint(&s.donor, &1_000);
@@ -2572,11 +2671,48 @@ fn non_admin_cannot_set_the_per_donor_cap() {
 }
 
 #[test]
+fn create_stream_rejects_self_stream() {
+    let s = setup();
+    s.token_admin.mint(&s.donor, &2_000);
+
+    // Positive control: valid distinct donor and NGO succeeds
+    let stream_id = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+    assert_eq!(s.client.get_stream(&stream_id).balance, 1_000);
+
+    // Targeted check: donor == ngo fails with SelfStream
+    let result = s
+        .client
+        .try_create_stream(&s.donor, &s.donor, &s.token.address, &1_000, &10);
+    assert_eq!(result, Err(Ok(Error::SelfStream)));
+}
+
+#[test]
+fn create_stream_rejects_deposit_too_low() {
+    let s = setup();
+    s.token_admin.mint(&s.donor, &2_000);
+    s.client.set_min_deposit(&1_000);
+
+    // Targeted check: valid distinct parties, deposit below min_deposit fails with DepositTooLow
+    let result = s
+        .client
+        .try_create_stream(&s.donor, &s.ngo, &s.token.address, &999, &10);
+    assert_eq!(result, Err(Ok(Error::DepositTooLow)));
+
+    // Positive control: meeting min_deposit succeeds
+    let stream_id = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+    assert_eq!(s.client.get_stream(&stream_id).balance, 1_000);
+}
+
+#[test]
 fn create_stream_rejects_the_101st_stream() {
     let s = setup();
     s.token_admin.mint(&s.donor, &1_000_000);
 
-    // Fill the default cap.
+    // Fill the default per-donor cap (100 streams).
     for _ in 0..100 {
         s.client
             .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
@@ -2585,8 +2721,17 @@ fn create_stream_rejects_the_101st_stream() {
     let result = s
         .client
         .try_create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
-    assert!(result.is_err());
+    assert_eq!(result, Err(Ok(Error::StreamLimitExceeded)));
+
+    // Positive control: cap is per-donor, so a different donor can still create a stream
+    let other_donor = Address::generate(&s.env);
+    s.token_admin.mint(&other_donor, &1_000);
+    let other_id = s
+        .client
+        .create_stream(&other_donor, &s.ngo, &s.token.address, &1_000, &10);
+    assert_eq!(s.client.get_stream(&other_id).donor, other_donor);
 }
+
 
 #[test]
 fn raising_the_cap_lets_the_next_stream_through() {
@@ -2601,7 +2746,7 @@ fn raising_the_cap_lets_the_next_stream_through() {
     let result = s
         .client
         .try_create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
-    assert!(result.is_err());
+    assert_eq!(result, Err(Ok(Error::StreamLimitExceeded)));
 
     // Raise the cap. Next call succeeds.
     s.client.set_max_streams_per_donor(&2);
@@ -2629,7 +2774,7 @@ fn lowering_the_cap_does_not_retroactively_affect_existing_streams() {
     let result = s
         .client
         .try_create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
-    assert!(result.is_err());
+    assert_eq!(result, Err(Ok(Error::StreamLimitExceeded)));
 
     // Existing streams are untouched and still withdrawable.
     s.env.ledger().with_mut(|l| l.timestamp += 50);
@@ -3000,6 +3145,108 @@ fn transfer_stream_bumps_instance_and_stream_ttl() {
     assert_eq!(instance_ttl(&s), INSTANCE_BUMP_AMOUNT);
     assert_eq!(stream_ttl(&s, stream_id), STREAM_BUMP_AMOUNT);
 }
+
+#[test]
+fn transfer_stream_rejects_unauthorized_caller() {
+    let s = setup();
+    s.token_admin.mint(&s.donor, &1_000);
+    let new_ngo = Address::generate(&s.env);
+
+    let stream_id = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+
+    let attacker = Address::generate(&s.env);
+    s.env.mock_auths(&[MockAuth {
+        address: &attacker,
+        invoke: &MockAuthInvoke {
+            contract: &s.client.address,
+            fn_name: "transfer_stream",
+            args: (stream_id, new_ngo.clone()).into_val(&s.env),
+            sub_invokes: &[],
+        },
+    }]);
+
+    let result = s.client.try_transfer_stream(&stream_id, &new_ngo);
+    assert!(result.is_err());
+}
+
+#[test]
+fn transfer_stream_rejects_self_stream() {
+    let s = setup();
+    s.token_admin.mint(&s.donor, &1_000);
+
+    let stream_id = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+
+    let result = s.client.try_transfer_stream(&stream_id, &s.donor);
+    assert_eq!(result, Err(Ok(Error::SelfStream)));
+}
+
+#[test]
+fn transfer_stream_to_same_ngo_is_noop() {
+    let s = setup();
+    s.token_admin.mint(&s.donor, &1_000);
+
+    let stream_id = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+
+    let result = s.client.try_transfer_stream(&stream_id, &s.ngo);
+    assert_eq!(result, Ok(Ok(())));
+    assert_eq!(s.client.get_stream(&stream_id).ngo, s.ngo);
+}
+
+#[test]
+fn transfer_stream_rejects_unverified_new_ngo_when_registry_configured() {
+    let (s, registry) = setup_with_registry();
+    s.token_admin.mint(&s.donor, &1_000);
+
+    registry.register(&s.ngo, &soroban_sdk::String::from_str(&s.env, "Old NGO"));
+    registry.approve_ngo(&s.ngo);
+
+    let stream_id = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+
+    let new_ngo = Address::generate(&s.env);
+    // new_ngo is not registered / approved in registry
+    let result = s.client.try_transfer_stream(&stream_id, &new_ngo);
+    assert_eq!(result, Err(Ok(Error::NgoNotVerified)));
+
+    // Now register and approve new_ngo
+    registry.register(&new_ngo, &soroban_sdk::String::from_str(&s.env, "New NGO"));
+    registry.approve_ngo(&new_ngo);
+    assert_eq!(s.client.try_transfer_stream(&stream_id, &new_ngo), Ok(Ok(())));
+    assert_eq!(s.client.get_stream(&stream_id).ngo, new_ngo);
+}
+
+#[test]
+fn transfer_stream_emits_event_with_settled_accrual() {
+    let s = setup();
+    s.token_admin.mint(&s.donor, &1_000);
+    let new_ngo = Address::generate(&s.env);
+
+    let stream_id = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+
+    // 50 seconds pass -> 500 settles to old NGO
+    s.env.ledger().with_mut(|l| l.timestamp += 50);
+
+    s.client.transfer_stream(&stream_id, &new_ngo);
+    let transferred = last_event(&s.env);
+
+    assert_eq!(
+        transferred,
+        (
+            (symbol_short!("transfer"), stream_id).into_val(&s.env),
+            (s.ngo.clone(), new_ngo.clone(), 500i128).into_val(&s.env),
+        )
+    );
+}
+
 
 #[test]
 fn double_init_fails_and_preserves_original_admin() {
@@ -3505,6 +3752,133 @@ fn create_stream_skips_verification_when_no_registry_configured() {
         .client
         .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
 
+    assert_eq!(s.client.get_stream(&stream_id).balance, 1_000);
+}
+
+#[test]
+fn bad_registry_fails_create_stream_and_clear_registry_restores_creation() {
+    let s = setup();
+    s.token_admin.mint(&s.donor, &2_000);
+
+    // Set an invalid registry address (not a real contract)
+    let bad_registry = Address::generate(&s.env);
+    s.client.set_registry(&bad_registry);
+    assert_eq!(s.client.registry(), Some(bad_registry));
+
+    // create_stream attempts cross-contract call to bad address, fails closed with NgoNotVerified
+    let result = s
+        .client
+        .try_create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+    assert_eq!(result, Err(Ok(Error::NgoNotVerified)));
+
+    // Admin clears the bad registry
+    s.client.clear_registry();
+    assert_eq!(s.client.registry(), None);
+
+    // Now streams can be created again (skips verification)
+    let stream_id = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+    assert_eq!(s.client.get_stream(&stream_id).balance, 1_000);
+}
+
+#[test]
+fn clear_registry_requires_admin_auth() {
+    let s = setup();
+    let admin = s.client.admin();
+    let registry_addr = Address::generate(&s.env);
+    s.client.set_registry(&registry_addr);
+
+    s.client.clear_registry();
+    assert_auth_required_from(&s, &admin, "clear_registry");
+}
+
+#[test]
+fn clear_registry_rejects_non_admin_and_preserves_registry() {
+    let s = setup();
+    let registry_addr = Address::generate(&s.env);
+    s.client.set_registry(&registry_addr);
+
+    let non_admin = Address::generate(&s.env);
+    s.env.mock_auths(&[MockAuth {
+        address: &non_admin,
+        invoke: &MockAuthInvoke {
+            contract: &s.client.address,
+            fn_name: "clear_registry",
+            args: ().into_val(&s.env),
+            sub_invokes: &[],
+        },
+    }]);
+
+    let result = s.client.try_clear_registry();
+    assert!(result.is_err());
+    assert_eq!(s.client.registry(), Some(registry_addr));
+}
+
+#[test]
+fn clear_registry_on_already_unset_registry_is_idempotent() {
+    let s = setup();
+    assert_eq!(s.client.registry(), None);
+
+    let result = s.client.try_clear_registry();
+    assert_eq!(result, Ok(Ok(())));
+    assert_eq!(s.client.registry(), None);
+}
+
+#[test]
+fn clear_registry_emits_event() {
+    let s = setup();
+    let registry_addr = Address::generate(&s.env);
+    s.client.set_registry(&registry_addr);
+
+    s.client.clear_registry();
+    let event = last_event(&s.env);
+
+    assert_eq!(
+        event,
+        (
+            (symbol_short!("regclr"),).into_val(&s.env),
+            ().into_val(&s.env),
+        )
+    );
+}
+
+#[test]
+fn valid_registry_can_be_set_again_after_clearing() {
+    let s = setup();
+    s.token_admin.mint(&s.donor, &2_000);
+
+    let admin = s.client.admin();
+    let registry_id = s.env.register(
+        ngo_registry::NgoRegistry,
+        ngo_registry::NgoRegistryArgs::__constructor(&admin),
+    );
+    let registry_client = ngo_registry::NgoRegistryClient::new(&s.env, &registry_id);
+
+    // Set registry
+    s.client.set_registry(&registry_id);
+    assert_eq!(s.client.registry(), Some(registry_id.clone()));
+
+    // Clear registry
+    s.client.clear_registry();
+    assert_eq!(s.client.registry(), None);
+
+    // Re-set valid registry
+    s.client.set_registry(&registry_id);
+    assert_eq!(s.client.registry(), Some(registry_id.clone()));
+
+    // Unverified NGO fails
+    let result = s
+        .client
+        .try_create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+    assert_eq!(result, Err(Ok(Error::NgoNotVerified)));
+
+    // Approve NGO and succeed
+    registry_client.register(&s.ngo, &soroban_sdk::String::from_str(&s.env, "Red Cross"));
+    registry_client.approve_ngo(&s.ngo);
+    let stream_id = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
     assert_eq!(s.client.get_stream(&stream_id).balance, 1_000);
 }
 

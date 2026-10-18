@@ -145,6 +145,11 @@ pub struct RegistrySetEvent {
     pub registry: Address,
 }
 
+#[contractevent(topics = ["regclr"], data_format = "single-value")]
+pub struct RegistryClearedEvent {
+    pub data: (),
+}
+
 #[contractevent(topics = ["init"], data_format = "single-value")]
 pub struct InitializedEvent {
     pub admin: Address,
@@ -350,7 +355,13 @@ pub enum Error {
     NotPaused = 22,
     /// Every stream in a batch withdrawal must target the same NGO.
     MixedNgo = 23,
+    /// The number of stream IDs requested in `get_streams` exceeds `MAX_BATCH_GET_STREAMS`.
+    BatchLimitExceeded = 24,
 }
+
+/// Maximum number of streams that can be requested in a single `get_streams` call.
+/// Chosen to stay well within Soroban's per-transaction ledger read footprint limit (40 reads).
+pub const MAX_BATCH_GET_STREAMS: u32 = 40;
 
 const MAX_FEE_BPS: u32 = 1_000;
 
@@ -833,6 +844,54 @@ impl DonationVault {
             .persistent()
             .get(&DataKey::Stream(stream_id))
             .ok_or(Error::StreamNotFound)
+    }
+
+    /// Reads multiple streams in a single call, returning one entry per
+    /// requested id in the same order (`None` for an id that does not exist).
+    /// Read-only; requires no authorization.
+    ///
+    /// Requests with more than `MAX_BATCH_GET_STREAMS` ids are rejected with
+    /// `Error::BatchLimitExceeded`.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// # use soroban_sdk::{testutils::Address as _, token, Address, Env, Vec};
+    /// # use donation_vault::{DonationVault, DonationVaultClient};
+    /// # let env = Env::default();
+    /// # env.mock_all_auths();
+    /// # let contract_id = env.register(DonationVault, ());
+    /// # let client = DonationVaultClient::new(&env, &contract_id);
+    /// # let admin = Address::generate(&env);
+    /// # client.init(&admin);
+    /// # let token_admin = Address::generate(&env);
+    /// # let sac = env.register_stellar_asset_contract_v2(token_admin.clone());
+    /// # let token_client = token::StellarAssetClient::new(&env, &sac.address());
+    /// # let donor = Address::generate(&env);
+    /// # let ngo = Address::generate(&env);
+    /// # token_client.mint(&donor, &2_000);
+    /// let a = client.create_stream(&donor, &ngo, &sac.address(), &1_000, &10);
+    /// let b = client.create_stream(&donor, &ngo, &sac.address(), &1_000, &20);
+    ///
+    /// let mut ids = Vec::new(&env);
+    /// ids.push_back(a);
+    /// ids.push_back(999); // never created
+    /// ids.push_back(b);
+    ///
+    /// let streams = client.get_streams(&ids).unwrap();
+    /// assert!(streams.get(0).unwrap().is_some());
+    /// assert!(streams.get(1).unwrap().is_none());
+    /// assert_eq!(streams.get(2).unwrap().unwrap().rate, 20);
+    /// ```
+    pub fn get_streams(env: Env, ids: Vec<u64>) -> Result<Vec<Option<Stream>>, Error> {
+        if ids.len() > MAX_BATCH_GET_STREAMS {
+            return Err(Error::BatchLimitExceeded);
+        }
+        let mut streams: Vec<Option<Stream>> = Vec::new(&env);
+        for id in ids.iter() {
+            streams.push_back(env.storage().persistent().get(&DataKey::Stream(id)));
+        }
+        Ok(streams)
     }
 
     /// Lists every stream id belonging to `donor`, in creation order.
@@ -1617,8 +1676,10 @@ impl DonationVault {
             .unwrap_or(DEFAULT_MAX_STREAMS_PER_DONOR)
     }
 
-    /// Sets (or clears) the NGO registry contract used to verify NGOs
-    /// before a stream is opened. Admin-gated.
+    /// Sets the NGO registry contract used to verify NGOs before a stream
+    /// is opened. Admin-gated.
+    ///
+    /// To clear an existing registry, use [`clear_registry`](Self::clear_registry).
     ///
     /// # Examples
     ///
@@ -1641,6 +1702,46 @@ impl DonationVault {
         extend_instance_ttl(&env);
 
         RegistrySetEvent { registry }.publish(&env);
+
+        Ok(())
+    }
+
+    /// Clears the configured NGO registry address, disabling registry verification
+    /// for subsequent streams. Admin-gated.
+    ///
+    /// # Trade-off
+    ///
+    /// Clearing the registry turns off NGO verification for all new streams opened
+    /// while the registry is unset — any recipient address (as long as it differs from
+    /// the donor) will be accepted. Use `set_registry` to configure a new registry.
+    ///
+    /// If no registry was set, this is an idempotent no-op (mirroring `clear_treasury`),
+    /// removing the key if present, extending instance TTL, and publishing the `regclr` event.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// # use soroban_sdk::{testutils::Address as _, Address, Env};
+    /// # use donation_vault::{DonationVault, DonationVaultClient};
+    /// # let env = Env::default();
+    /// # env.mock_all_auths();
+    /// # let contract_id = env.register(DonationVault, ());
+    /// # let client = DonationVaultClient::new(&env, &contract_id);
+    /// # let admin = Address::generate(&env);
+    /// # client.init(&admin);
+    /// let registry = Address::generate(&env);
+    /// client.set_registry(&registry);
+    /// assert_eq!(client.registry(), Some(registry));
+    ///
+    /// client.clear_registry();
+    /// assert_eq!(client.registry(), None);
+    /// ```
+    pub fn clear_registry(env: Env) -> Result<(), Error> {
+        require_admin(&env)?;
+        env.storage().instance().remove(&DataKey::Registry);
+        extend_instance_ttl(&env);
+
+        RegistryClearedEvent { data: () }.publish(&env);
 
         Ok(())
     }
@@ -2393,9 +2494,35 @@ impl DonationVault {
             return Err(Error::StreamCancelled);
         }
 
+        if new_ngo == stream.donor {
+            return Err(Error::SelfStream);
+        }
+
+        if new_ngo == stream.ngo {
+            return Ok(());
+        }
+
+        if let Some(registry_addr) = env
+            .storage()
+            .instance()
+            .get::<_, Address>(&DataKey::Registry)
+        {
+            let registry = NgoRegistryClient::new(&env, &registry_addr);
+            let ngo_entry = registry
+                .try_get_ngo(&new_ngo)
+                .map_err(|_| Error::NgoNotVerified)?
+                .map_err(|_| Error::NgoNotVerified)?;
+            if !ngo_entry.verified {
+                return Err(Error::NgoNotVerified);
+            }
+        }
+
         let old_ngo = stream.ngo.clone();
         let now = env.ledger().timestamp();
         let settled = settle(&env, &mut stream, now)?;
+        if stream.balance == 0 {
+            stream.status = StreamStatus::Drained;
+        }
         stream.ngo = new_ngo.clone();
 
         env.storage().persistent().set(&key, &stream);
