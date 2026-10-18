@@ -1791,6 +1791,25 @@ fn top_up_checks_the_amount_before_the_stream_id() {
 }
 
 #[test]
+fn top_up_rejects_below_minimum_deposit() {
+    let s = setup();
+    s.token_admin.mint(&s.donor, &1_500);
+
+    s.client.set_min_deposit(&100);
+    let stream_id = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+
+    // Below minimum should fail
+    let result = s.client.try_top_up(&stream_id, &50);
+    assert_eq!(result, Err(Ok(Error::DepositTooLow)));
+
+    // At minimum should succeed
+    s.client.top_up(&stream_id, &100);
+    assert_eq!(s.client.get_stream(&stream_id).balance, 1_100);
+}
+
+#[test]
 fn get_stream_on_unknown_id_fails() {
     let s = setup();
 
@@ -2900,19 +2919,19 @@ fn stream_status_state_machine_walks_each_transition() {
     use Step::*;
 
     // The create call is implicit for every case: a fresh stream starts Active.
-    // Top-up deliberately leaves a drained stream at Drained until it is
-    // cancelled or drained again; that is the behaviour covered by issue #298
-    // and pinned here so the state machine has one source of truth.
+    // Top-up reactivates a drained stream if it has a positive balance after
+    // the top-up; that is the behaviour covered by issue #298 and pinned here
+    // so the state machine has one source of truth.
     let cases: &[(&str, &[Step])] = &[
         (
-            "active -> drained -> top-up keeps drained -> cancelled",
+            "active -> drained -> top-up reactivates -> cancelled",
             &[
                 Expect(StreamStatus::Active),
                 Advance(100),
                 Withdraw,
                 Expect(StreamStatus::Drained),
                 TopUp(100),
-                Expect(StreamStatus::Drained),
+                Expect(StreamStatus::Active),
                 Cancel,
                 Expect(StreamStatus::Cancelled),
             ],
@@ -4355,14 +4374,13 @@ fn modify_rate_and_top_up_on_a_drained_stream() {
     assert_eq!(after_modify.status, StreamStatus::Drained);
     assert!(!after_modify.cancelled);
 
-    // top_up is allowed, adds balance, and leaves the stored status as
-    // Drained (the current code does not recompute status on top-up).
+    // top_up is allowed, adds balance, and reactivates the drained stream.
     let top_up = s.client.try_top_up(&stream_id, &500);
     assert_eq!(top_up, Ok(Ok(())));
     let after_top_up = s.client.get_stream(&stream_id);
     assert_eq!(after_top_up.balance, 500);
     assert_eq!(after_top_up.rate, 20);
-    assert_eq!(after_top_up.status, StreamStatus::Drained);
+    assert_eq!(after_top_up.status, StreamStatus::Active);
     assert!(!after_top_up.cancelled);
 
     // The new balance accrues at the new rate.
