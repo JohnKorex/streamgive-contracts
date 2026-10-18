@@ -629,14 +629,14 @@ impl NgoRegistry {
         Ok(())
     }
 
-    /// Deprecated alias of [`ngo_count`](Self::ngo_count).
+    /// Deprecated alias of `ngo_count`.
     ///
     /// Reads the same single stored counter (`NgoCount`) as `ngo_count()`.
     /// Preserved for backwards compatibility with existing callers.
     ///
     /// # Conversion
     /// Returns the live count as `u32`. If the stored `u64` count exceeds
-    /// `u32::MAX`, saturates at `u32::MAX`. Callers should prefer [`ngo_count`](Self::ngo_count).
+    /// `u32::MAX`, saturates at `u32::MAX`. Callers should prefer `ngo_count`.
     pub fn total_ngos(env: Env) -> u32 {
         u32::try_from(Self::ngo_count(env)).unwrap_or(u32::MAX)
     }

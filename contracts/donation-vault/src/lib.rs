@@ -1711,7 +1711,7 @@ impl DonationVault {
     /// Sets the NGO registry contract used to verify NGOs before a stream
     /// is opened. Admin-gated.
     ///
-    /// To clear an existing registry, use [`clear_registry`](Self::clear_registry).
+    /// To clear an existing registry, use `clear_registry`.
     ///
     /// # Examples
     ///
