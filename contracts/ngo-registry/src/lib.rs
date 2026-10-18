@@ -623,12 +623,18 @@ impl NgoRegistry {
             return Err(Error::AlreadyVerified);
         }
 
-        ngo.name = name.clone();
-        env.storage().persistent().set(&key, &ngo);
-        extend_instance_ttl(&env);
-        extend_ngo_ttl(&env, &owner);
-
-        RenamedEvent { owner, name }.publish(&env);
+// Validate name whitespace
+        if is_whitespace_only(&name) {
+            return Err(Error::InvalidName);
+        }
+        // Only update and emit event if the name actually changes
+        if ngo.name != name {
+            ngo.name = name.clone();
+            env.storage().persistent().set(&key, &ngo);
+            extend_instance_ttl(&env);
+            extend_ngo_ttl(&env, &owner);
+            RenamedEvent { owner, name }.publish(&env);
+        }
 
         Ok(())
     }
