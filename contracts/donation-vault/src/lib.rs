@@ -890,13 +890,12 @@ impl DonationVault {
     ///
     /// ```rust,no_run
     /// # use soroban_sdk::{testutils::Address as _, token, Address, Env, Vec};
-    /// # use donation_vault::{DonationVault, DonationVaultClient};
+    /// # use donation_vault::{DonationVault, DonationVaultArgs, DonationVaultClient};
     /// # let env = Env::default();
     /// # env.mock_all_auths();
-    /// # let contract_id = env.register(DonationVault, ());
-    /// # let client = DonationVaultClient::new(&env, &contract_id);
     /// # let admin = Address::generate(&env);
-    /// # client.init(&admin);
+    /// # let contract_id = env.register(DonationVault, DonationVaultArgs::__constructor(&admin));
+    /// # let client = DonationVaultClient::new(&env, &contract_id);
     /// # let token_admin = Address::generate(&env);
     /// # let sac = env.register_stellar_asset_contract_v2(token_admin.clone());
     /// # let token_client = token::StellarAssetClient::new(&env, &sac.address());
@@ -911,7 +910,7 @@ impl DonationVault {
     /// ids.push_back(999); // never created
     /// ids.push_back(b);
     ///
-    /// let streams = client.get_streams(&ids).unwrap();
+    /// let streams = client.get_streams(&ids);
     /// assert!(streams.get(0).unwrap().is_some());
     /// assert!(streams.get(1).unwrap().is_none());
     /// assert_eq!(streams.get(2).unwrap().unwrap().rate, 20);
@@ -2115,7 +2114,7 @@ impl DonationVault {
             total_accrued = total_accrued
                 .checked_add(accrued)
                 .ok_or(Error::ArithmeticOverflow)?;
-            
+
             let fee = if accrued > 0 {
                 compute_fee(&env, &stream.token, accrued)
             } else {
@@ -2179,7 +2178,11 @@ impl DonationVault {
                 for (token, fee_total) in fee_payouts.iter() {
                     if fee_total > 0 {
                         let token_client = token::Client::new(&env, &token);
-                        token_client.transfer(&env.current_contract_address(), &treasury_address, &fee_total);
+                        token_client.transfer(
+                            &env.current_contract_address(),
+                            &treasury_address,
+                            &fee_total,
+                        );
                     }
                 }
             }
@@ -2187,12 +2190,11 @@ impl DonationVault {
 
         // Emit a `withdraw` per contributing stream, matching `withdraw`'s
         // topics and data so the indexer needs no batch-specific handling.
-        let mut idx = 0;
-        for stream_id in stream_ids.iter() {
+        for (idx, stream_id) in stream_ids.iter().enumerate() {
+            let idx = idx as u32;
             let accrued = accrued_amounts.get(idx).unwrap_or(0);
             let net = net_amounts.get(idx).unwrap_or(0);
-            idx += 1;
-            
+
             if accrued > 0 {
                 let fee = accrued.checked_sub(net).unwrap_or(0);
                 WithdrawnEvent {
@@ -2466,12 +2468,12 @@ impl DonationVault {
             .balance
             .checked_add(amount)
             .ok_or(Error::ArithmeticOverflow)?;
-        
+
         // Reactivate a drained stream if it now has a positive balance
         if stream.status == StreamStatus::Drained && stream.balance > 0 {
             stream.status = StreamStatus::Active;
         }
-        
+
         let total_donated: i128 = env
             .storage()
             .instance()

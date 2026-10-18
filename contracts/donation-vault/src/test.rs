@@ -62,17 +62,6 @@ fn last_event(env: &Env) -> LastEvent {
     }
 }
 
-/// The number of events emitted by `contract`. Filters by contract address
-/// so token transfers firing inside the same invocation don't inflate the
-/// count, and only covers the most recent invocation.
-fn event_count(env: &Env, contract: &Address) -> usize {
-    env.events()
-        .all()
-        .filter_by_contract(contract)
-        .events()
-        .len()
-}
-
 fn create_token<'a>(env: &Env, admin: &Address) -> (TokenClient<'a>, StellarAssetClient<'a>) {
     let sac = env.register_stellar_asset_contract_v2(admin.clone());
     (
@@ -1643,7 +1632,7 @@ fn cancel_stream_twice_is_harmless() {
     // or resetting last_update, maintaining consistency with top_up and modify_rate.
     s.env.ledger().with_mut(|l| l.timestamp += 50);
     let last_update_before_second_cancel = stream.last_update;
-    
+
     let result = s.client.try_cancel_stream(&stream_id);
     assert_eq!(result, Err(Ok(Error::StreamCancelled)));
 
@@ -2743,7 +2732,6 @@ fn create_stream_rejects_the_101st_stream() {
     assert_eq!(s.client.get_stream(&other_id).donor, other_donor);
 }
 
-
 #[test]
 fn raising_the_cap_lets_the_next_stream_through() {
     let s = setup();
@@ -3229,7 +3217,10 @@ fn transfer_stream_rejects_unverified_new_ngo_when_registry_configured() {
     // Now register and approve new_ngo
     registry.register(&new_ngo, &soroban_sdk::String::from_str(&s.env, "New NGO"));
     registry.approve_ngo(&new_ngo);
-    assert_eq!(s.client.try_transfer_stream(&stream_id, &new_ngo), Ok(Ok(())));
+    assert_eq!(
+        s.client.try_transfer_stream(&stream_id, &new_ngo),
+        Ok(Ok(()))
+    );
     assert_eq!(s.client.get_stream(&stream_id).ngo, new_ngo);
 }
 
@@ -3257,7 +3248,6 @@ fn transfer_stream_emits_event_with_settled_accrual() {
         )
     );
 }
-
 
 #[test]
 fn double_init_fails_and_preserves_original_admin() {
@@ -3935,7 +3925,10 @@ fn top_up_after_revocation_fails_and_preserves_state() {
 
     // State, balances, and totals are unchanged
     assert_eq!(s.token.balance(&s.donor), donor_balance_before);
-    assert_eq!(s.client.get_stream(&stream_id).balance, stream_balance_before);
+    assert_eq!(
+        s.client.get_stream(&stream_id).balance,
+        stream_balance_before
+    );
     assert_eq!(s.client.get_config().total_donated, total_donated_before);
 }
 
@@ -3967,7 +3960,10 @@ fn top_up_after_re_verification_succeeds() {
 
     // Revoke and verify top_up fails
     registry.revoke_ngo(&s.ngo);
-    assert_eq!(s.client.try_top_up(&stream_id, &500), Err(Ok(Error::NgoNotVerified)));
+    assert_eq!(
+        s.client.try_top_up(&stream_id, &500),
+        Err(Ok(Error::NgoNotVerified))
+    );
 
     // Re-verify the NGO
     registry.approve_ngo(&s.ngo);
@@ -3997,7 +3993,7 @@ fn cancel_and_withdraw_still_work_for_stream_whose_ngo_was_revoked() {
     s.env.ledger().with_mut(|l| l.timestamp += 20);
 
     // NGO can still withdraw already accrued funds
-    s.client.withdraw(&stream_id, &200);
+    s.client.withdraw(&stream_id);
     assert_eq!(s.token.balance(&s.ngo), 200);
 
     // Donor can still cancel and receive refund of remaining 800 tokens
@@ -4062,10 +4058,11 @@ fn withdraw_batch_across_several_streams() {
 
     let amounts = s.client.withdraw_batch(&ids);
 
-    // Accruals: 50 * 10 = 500, 50 * 20 = 1000, 50 * 10 = 500
-    assert_eq!(amounts.get(0), Some(500));
-    assert_eq!(amounts.get(1), Some(1_000));
-    assert_eq!(amounts.get(2), Some(500));
+    // Accruals: 50 * 10 = 500, 50 * 20 = 1000, 50 * 10 = 500. Like `withdraw`,
+    // each entry is the stream's payout after the 5% fee.
+    assert_eq!(amounts.get(0), Some(475));
+    assert_eq!(amounts.get(1), Some(950));
+    assert_eq!(amounts.get(2), Some(475));
 
     let gross: i128 = 500 + 1_000 + 500;
     let fee: i128 = (gross * 500) / 10_000; // 100
@@ -4183,10 +4180,12 @@ fn withdraw_batch_multi_token_fee_aggregation_and_override() {
     ids.push_back(s2);
     ids.push_back(s3);
 
+    // Each entry is the stream's payout after its token's fee: 5% on token A,
+    // the 10% override on token B.
     let amounts = s.client.withdraw_batch(&ids);
-    assert_eq!(amounts.get(0), Some(500));
-    assert_eq!(amounts.get(1), Some(500));
-    assert_eq!(amounts.get(2), Some(1_000));
+    assert_eq!(amounts.get(0), Some(475));
+    assert_eq!(amounts.get(1), Some(475));
+    assert_eq!(amounts.get(2), Some(900));
 
     // Token A: 500 + 500 = 1000 gross. Global fee 5% = 50 fee, 950 net.
     let token_a_gross: i128 = 1_000;
@@ -4269,11 +4268,13 @@ fn withdraw_batch_rejects_non_ngo_caller() {
 }
 
 #[test]
-fn withdraw_batch_empty_batch_returns_empty_and_succeeds() {
+fn withdraw_batch_empty_batch_fails_with_nothing_to_withdraw() {
     let s = setup();
     let ids = Vec::new(&s.env);
-    let amounts = s.client.withdraw_batch(&ids);
-    assert_eq!(amounts.len(), 0);
+    assert_eq!(
+        s.client.try_withdraw_batch(&ids),
+        Err(Ok(Error::NothingToWithdraw))
+    );
 }
 
 #[test]
@@ -4554,19 +4555,6 @@ fn settle_marks_stream_drained_when_balance_reaches_zero() {
 // =============================================================================
 
 #[test]
-fn init_publishes_init_event() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let admin = Address::generate(&env);
-    let contract_id = env.register(DonationVault, ());
-    let client = DonationVaultClient::new(&env, &contract_id);
-
-    client.init(&admin);
-
-    assert_last_event(&env, (symbol_short!("init"),), admin.clone());
-}
-
-#[test]
 fn constructor_publishes_init_event() {
     let env = Env::default();
     env.mock_all_auths();
@@ -4624,9 +4612,5 @@ fn upgrade_publishes_event() {
 
     s.client.upgrade(&new_wasm_hash);
 
-    assert_last_event(
-        &s.env,
-        (symbol_short!("upgrade"),),
-        new_wasm_hash.clone(),
-    );
+    assert_last_event(&s.env, (symbol_short!("upgrade"),), new_wasm_hash.clone());
 }

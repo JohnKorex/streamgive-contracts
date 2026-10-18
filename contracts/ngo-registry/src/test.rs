@@ -47,29 +47,6 @@ fn init_without_admin_auth_fails() {
 }
 
 #[test]
-fn init_publishes_init_event() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let admin = Address::generate(&env);
-    let contract_id = env.register(NgoRegistry, ());
-    let client = NgoRegistryClient::new(&env, &contract_id);
-
-    client.init(&admin);
-
-    assert_eq!(
-        env.events().all(),
-        vec![
-            &env,
-            (
-                contract_id.clone(),
-                (symbol_short!("init"),).into_val(&env),
-                admin.into_val(&env),
-            ),
-        ]
-    );
-}
-
-#[test]
 fn constructor_publishes_init_event() {
     let env = Env::default();
     env.mock_all_auths();
@@ -440,32 +417,33 @@ fn batch_approve_approves_each_ngo_and_publishes_events() {
 
     client.batch_approve(&vec![&env, a.clone(), b.clone(), c.clone()]);
 
-    assert!(client.get_ngo(&a).verified);
-    assert!(client.get_ngo(&b).verified);
-    assert!(client.get_ngo(&c).verified);
-
-    // One `approved` event per NGO, in batch order.
+    // One `approved` event per NGO, in batch order. Checked before any other
+    // call, because `events().all()` only covers the most recent invocation.
     assert_eq!(
         env.events().all(),
         vec![
             &env,
             (
                 client.address.clone(),
-                (symbol_short!("approved"), a).into_val(&env),
+                (symbol_short!("approved"), a.clone()).into_val(&env),
                 ().into_val(&env),
             ),
             (
                 client.address.clone(),
-                (symbol_short!("approved"), b).into_val(&env),
+                (symbol_short!("approved"), b.clone()).into_val(&env),
                 ().into_val(&env),
             ),
             (
                 client.address.clone(),
-                (symbol_short!("approved"), c).into_val(&env),
+                (symbol_short!("approved"), c.clone()).into_val(&env),
                 ().into_val(&env),
             ),
         ]
     );
+
+    assert!(client.get_ngo(&a).verified);
+    assert!(client.get_ngo(&b).verified);
+    assert!(client.get_ngo(&c).verified);
 }
 
 #[test]

@@ -48,22 +48,4 @@ for i in "${!MAX_NAMES[@]}"; do
   fi
 done
 
-# duplicate loop removed
-    echo "error: $wasm_path not found — build the wasm32v1-none release target first" >&2
-    status=1
-    continue
-  fi
-
-  size=$(wc -c < "$wasm_path")
-  size_kib=$((size / 1024))
-  max_kib=$((max / 1024))
-
-  if (( size > max )); then
-    echo "FAIL: ${name}.wasm is ${size} bytes (${size_kib} KiB), exceeding the ${max} byte (${max_kib} KiB) budget"
-    status=1
-  else
-    echo "OK: ${name}.wasm is ${size} bytes (${size_kib} KiB), within the ${max} byte (${max_kib} KiB) budget"
-  fi
-done
-
 exit "$status"
