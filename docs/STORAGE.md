@@ -27,7 +27,7 @@ counts below assume a 5-second average ledger close time
 | Key | Storage | Bump / threshold | Purpose |
 | --- | --- | --- | --- |
 | `Admin` | Instance | 30d / 29d | The address that can pause/unpause, set the fee, and manage the treasury. |
-| `PendingAdmin` | Instance | 30d / 29d | Address proposed by `propose_admin`, awaiting `accept_admin`. |
+| `PendingAdmin` | Instance | 30d / 29d | The pending admin address (`Address`) proposed by `propose_admin`, awaiting `accept_admin`. |
 | `NextStreamId` | Instance | 30d / 29d | Auto-incrementing counter handed out by `create_stream`. |
 | `Paused` | Instance | 30d / 29d | Emergency-brake flag checked by `require_not_paused`. |
 | `Treasury` | Instance | 30d / 29d | Address that receives the protocol fee cut on withdrawal. |
