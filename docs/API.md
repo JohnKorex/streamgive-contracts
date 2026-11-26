@@ -100,7 +100,10 @@ returns `NotRegistered`; boolean/list views return empty/false for absent data.
 | `propose_admin` | `new_admin: Address` / `Result<(), Error>` | admin | `NotInitialized`, `InvalidAdmin` | `propadmin` |
 | `accept_admin` | none / `Result<(), Error>` | pending admin | `NoPendingAdmin` | `acptadmin` |
 | `cancel_admin_proposal` | none / `Result<(), Error>` | admin | `NoPendingAdmin` | `canceladm` |
-| `register` | `owner: Address, name: String` / `Result<(), Error>` | owner | `AlreadyRegistered`, `InvalidName`, `NameTooLong` | `register` |
+| `pause_registrations` | none / `Result<(), Error>` | admin | `NotInitialized`, `RegistrationsPaused` | `regrpause` |
+| `resume_registrations` | none / `Result<(), Error>` | admin | `NotInitialized` | `regresume` |
+| `registrations_paused` | none / `bool` | none | — | — |
+| `register` | `owner: Address, name: String` / `Result<(), Error>` | owner | `AlreadyRegistered`, `InvalidName`, `NameTooLong`, `RegistrationsPaused` | `register` |
 | `total_ngos` | none / `u32` | none | — | — |
 | `unregister` | `owner: Address` / `Result<(), Error>` | owner | `NotRegistered`, `AlreadyVerified` | `unregist` |
 | `remove_ngo` | `ngo_owner: Address` / `Result<(), Error>` | admin | `NotRegistered`, `AlreadyVerified` | `removed` |

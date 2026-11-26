@@ -60,6 +60,7 @@ for what works while the vault is paused, and the
 | `clear_registry` | Admin | |
 | `rescue_stream` | Admin | Only while the vault is paused. |
 | `sweep_surplus` | Admin | Sends to the configured treasury. |
+| `sweep_surplus_to` | Admin | Sends to an explicit destination; no treasury needed. |
 | `upgrade` | Admin | Only while `upgrade_delay` is zero. |
 | `set_upgrade_delay` | Admin | |
 | `propose_upgrade` | Admin | |
@@ -90,6 +91,7 @@ for what works while the vault is paused, and the
 | `streams_by_donor` | Anyone | View. |
 | `donor_totals` | Anyone | View. |
 | `streams_by_ngo` | Anyone | View. |
+| `active_streams_by_ngo` | Anyone | View. Pages only `Active` and `Paused` streams. |
 | `stream_count` | Anyone | View. |
 | `pending_accrual` | Anyone | View. |
 | `depletion_time` | Anyone | View. |
@@ -132,6 +134,8 @@ for what works while the vault is paused, and the
 | `remove_ngo` | Admin | Unverified entries only. |
 | `set_verify_period` | Admin | |
 | `renew_ngo` | Admin | |
+| `pause_registrations` | Admin | Prevents `register` from accepting new applications. |
+| `resume_registrations` | Admin | Re-opens `register` after a pause. |
 | `upgrade` | Admin | |
 | `approve_ngo` | Approver | The `approver` argument signs. |
 | `batch_approve` | Approver | The `approver` argument signs. |
@@ -141,6 +145,7 @@ for what works while the vault is paused, and the
 | `unregister` | NGO | The `owner` argument signs. Unverified entries only. |
 | `update_name` | NGO | The `owner` argument signs. Unverified entries only. |
 | `set_metadata_uri` | NGO | The `owner` argument signs. |
+| `set_categories` | NGO | The `owner` argument signs. Unverified entries only. |
 | `touch_ngo` | Anyone | TTL bump only. |
 | `admin` | Anyone | View. |
 | `pending_admin` | Anyone | View. |
@@ -150,10 +155,13 @@ for what works while the vault is paused, and the
 | `list_ngos` | Anyone | View. |
 | `list_ngos_page` | Anyone | View. |
 | `metadata_uri` | Anyone | View. |
+| `owner_by_name` | Anyone | View. |
+| `categories` | Anyone | View. |
 | `get_ngo` | Anyone | View. |
 | `is_verified` | Anyone | View. |
 | `ngo_count` | Anyone | View. |
 | `verified_count` | Anyone | View. |
 | `verify_period` | Anyone | View. |
+| `registrations_paused` | Anyone | View. |
 
 <!-- roles:ngo-registry:end -->
