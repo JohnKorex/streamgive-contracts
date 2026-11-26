@@ -4334,7 +4334,7 @@ fn create_streams_for_ngo(s: &Setup<'_>, count: u32) -> Vec<u64> {
 }
 
 #[test]
-fn streams_by_ngo_pages_follow_the_compacted_index_after_transfers() {
+fn streams_by_ngo_pages_preserve_slot_cursors_after_transfers() {
     let s = setup();
     let other_ngo = Address::generate(&s.env);
     let count = MAX_STREAMS_BY_NGO + 3;
@@ -4356,35 +4356,44 @@ fn streams_by_ngo_pages_follow_the_compacted_index_after_transfers() {
 
     let mut expected_first = Vec::new(&s.env);
     expected_first.append(&ids.slice(0..2));
-    expected_first.append(&ids.slice(3..=MAX_STREAMS_BY_NGO));
+    expected_first.append(&ids.slice(3..MAX_STREAMS_BY_NGO));
     let start = 0u32;
     let page = s.client.streams_by_ngo(&s.ngo, &start, &MAX_STREAMS_BY_NGO);
     assert_eq!(page, expected_first);
 
-    let next = start + page.len();
-    assert_eq!(next, MAX_STREAMS_BY_NGO);
+    let next = start + MAX_STREAMS_BY_NGO;
     let tail = s.client.streams_by_ngo(&s.ngo, &next, &MAX_STREAMS_BY_NGO);
-    assert_eq!(tail, ids.slice(count - 1..count));
-    assert!(s
-        .client
-        .streams_by_ngo(&s.ngo, &(next + tail.len()), &MAX_STREAMS_BY_NGO)
-        .is_empty());
+    let expected_tail = Vec::from_array(
+        &s.env,
+        [ids.get(next).unwrap(), ids.get(count - 1).unwrap()],
+    );
+    assert_eq!(tail, expected_tail);
+    assert_eq!(s.client.ngo_stream_slots(&s.ngo), count);
 
     let cursor = s
         .client
         .withdraw_all(&s.ngo, &next, &MAX_BATCH_WITHDRAW_STREAMS);
     assert_eq!(cursor.amounts.len(), tail.len());
-    assert_eq!(cursor.next, next + tail.len());
+    assert_eq!(cursor.next, count);
+    assert!(s
+        .client
+        .streams_by_ngo(&s.ngo, &cursor.next, &MAX_STREAMS_BY_NGO)
+        .is_empty());
 
     assert_eq!(
-        s.client
-            .streams_by_ngo(&other_ngo, &0, &MAX_STREAMS_BY_NGO),
-        Vec::from_array(&s.env, [ids.get(2).unwrap(), ids.get(MAX_STREAMS_BY_NGO + 1).unwrap()])
+        s.client.streams_by_ngo(&other_ngo, &0, &MAX_STREAMS_BY_NGO),
+        Vec::from_array(
+            &s.env,
+            [
+                ids.get(2).unwrap(),
+                ids.get(MAX_STREAMS_BY_NGO + 1).unwrap()
+            ]
+        )
     );
 }
 
 #[test]
-fn streams_by_ngo_pages_keep_cancelled_ids_and_next_position() {
+fn streams_by_ngo_pages_omit_cancelled_ids_without_shifting_cursors() {
     let s = setup();
     let count = MAX_STREAMS_BY_NGO + 3;
     let ids = create_streams_for_ngo(&s, count);
@@ -4398,70 +4407,123 @@ fn streams_by_ngo_pages_keep_cancelled_ids_and_next_position() {
 
     let start = 0u32;
     let page = s.client.streams_by_ngo(&s.ngo, &start, &MAX_STREAMS_BY_NGO);
-    assert_eq!(page, ids.slice(0..MAX_STREAMS_BY_NGO));
-    let next = start + page.len();
-    assert_eq!(next, MAX_STREAMS_BY_NGO);
+    assert_eq!(page, ids.slice(1..MAX_STREAMS_BY_NGO));
+    let next = start + MAX_STREAMS_BY_NGO;
 
     let tail = s.client.streams_by_ngo(&s.ngo, &next, &MAX_STREAMS_BY_NGO);
-    assert_eq!(tail, ids.slice(MAX_STREAMS_BY_NGO..count));
-    assert!(s
-        .client
-        .streams_by_ngo(&s.ngo, &(next + tail.len()), &MAX_STREAMS_BY_NGO)
-        .is_empty());
+    assert_eq!(
+        tail,
+        Vec::from_array(&s.env, [ids.get(next).unwrap(), ids.get(next + 2).unwrap()])
+    );
 
     s.env.ledger().with_mut(|l| l.timestamp += 10);
     let cursor = s
         .client
         .withdraw_all(&s.ngo, &next, &MAX_BATCH_WITHDRAW_STREAMS);
-    assert_eq!(cursor.amounts, Vec::from_array(&s.env, [100i128, 0, 100]));
+    assert_eq!(cursor.amounts, Vec::from_array(&s.env, [100i128, 100]));
     assert_eq!(cursor.next, count);
 }
 
 #[test]
+fn ngo_index_prunes_drained_and_rescued_streams_and_appends_reactivated_streams() {
+    let s = setup();
+    let ids = create_streams_for_ngo(&s, 3);
+    let first = ids.get(0).unwrap();
+    let last = ids.get(2).unwrap();
+    s.env.ledger().with_mut(|l| l.timestamp += 100);
+
+    let pulled = s.client.withdraw_all(&s.ngo, &0, &2);
+    assert_eq!(pulled.amounts, Vec::from_array(&s.env, [1_000i128, 1_000]));
+    assert_eq!(pulled.next, 2);
+    assert!(s.client.streams_by_ngo(&s.ngo, &0, &2).is_empty());
+    let empty = s.client.withdraw_all(&s.ngo, &0, &2);
+    assert!(empty.amounts.is_empty());
+    assert_eq!(empty.next, 2);
+
+    s.token_admin.mint(&s.donor, &100);
+    s.client.top_up(&first, &100);
+    assert_eq!(
+        s.client.streams_by_ngo(&s.ngo, &2, &2),
+        Vec::from_array(&s.env, [last, first])
+    );
+
+    s.client.pause();
+    s.client.rescue_stream(&last);
+    assert_eq!(
+        s.client.streams_by_ngo(&s.ngo, &2, &2),
+        Vec::from_array(&s.env, [first])
+    );
+}
+
+#[test]
+fn ngo_index_keeps_legacy_positions_readable_without_rewriting_them() {
+    let s = setup();
+    let other_ngo = Address::generate(&s.env);
+    let ids = create_streams_for_ngo(&s, 2);
+    let first = ids.get(0).unwrap();
+    let second = ids.get(1).unwrap();
+    let key = DataKey::NgoStreams(s.ngo.clone());
+    s.env.as_contract(&s.client.address, || {
+        let storage = s.env.storage().persistent();
+        storage.set(&key, &ids);
+        storage.remove(&DataKey::NgoStreamSlots(s.ngo.clone()));
+        storage.remove(&DataKey::NgoStreamPage(s.ngo.clone(), 0));
+        storage.remove(&DataKey::NgoStreamSlot(first));
+        storage.remove(&DataKey::NgoStreamSlot(second));
+    });
+
+    assert_eq!(s.client.streams_by_ngo(&s.ngo, &0, &2), ids);
+    s.client.cancel_stream(&first);
+    s.client.transfer_stream(&second, &other_ngo);
+    assert!(s.client.streams_by_ngo(&s.ngo, &0, &2).is_empty());
+    s.client.transfer_stream(&second, &s.ngo);
+    assert_eq!(
+        s.client.streams_by_ngo(&s.ngo, &0, &3),
+        Vec::from_array(&s.env, [second])
+    );
+    assert_eq!(s.client.ngo_stream_slots(&s.ngo), 3);
+    s.env.as_contract(&s.client.address, || {
+        assert_eq!(s.env.storage().persistent().get(&key), Some(ids));
+    });
+}
+
+#[test]
 fn create_stream_cost_stays_flat_as_one_ngo_gains_streams() {
-    const STREAM_COUNT: u64 = 300;
+    const STREAM_COUNT: u64 = 1_000;
 
     let s = setup();
     s.client.set_max_streams_per_donor(&STREAM_COUNT);
     s.token_admin
         .mint(&s.donor, &(1_000 * STREAM_COUNT as i128));
 
-    let first = s
-        .client
-        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
-    let first_cost = s.env.cost_estimate().resources();
-
-    let mut last = first;
-    let mut last_cost = first_cost.clone();
-    for _ in 1..STREAM_COUNT {
-        last = s
+    let mut full_first_page = None;
+    for expected_id in 0..STREAM_COUNT {
+        let id = s
             .client
             .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
-        last_cost = s.env.cost_estimate().resources();
+        assert_eq!(id, expected_id);
+        if id == 9 {
+            full_first_page = Some(s.env.cost_estimate().resources());
+        }
+        if id < STREAM_COUNT - NGO_STREAM_PAGE_SIZE as u64 {
+            continue;
+        }
+
+        // Compare actual ledger storage costs: the SDK's native CPU and
+        // memory estimates also meter its growing in-memory test state.
+        let max = full_first_page.as_ref().unwrap();
+        let late = s.env.cost_estimate().resources();
+        assert_eq!(late.write_entries, max.write_entries);
+        assert!(late.write_bytes <= max.write_bytes);
+        if id == STREAM_COUNT - 1 {
+            assert_eq!(late.write_bytes, max.write_bytes);
+            assert_eq!(late.memory_read_entries, max.memory_read_entries);
+            assert_eq!(
+                late.persistent_rent_ledger_bytes,
+                max.persistent_rent_ledger_bytes
+            );
+        }
     }
-
-    assert_eq!(first, 0);
-    assert_eq!(last, STREAM_COUNT - 1);
-
-    let instruction_limit = first_cost.instructions * 2;
-    assert!(
-        last_cost.instructions <= instruction_limit,
-        "create_stream instructions grew from {} for the first stream to {} after {} streams (limit {})",
-        first_cost.instructions,
-        last_cost.instructions,
-        STREAM_COUNT,
-        instruction_limit,
-    );
-
-    let memory_limit = first_cost.mem_bytes * 2;
-    assert!(
-        last_cost.mem_bytes <= memory_limit,
-        "create_stream memory grew from {} bytes for the first stream to {} bytes after {} streams (limit {})",
-        first_cost.mem_bytes,
-        last_cost.mem_bytes,
-        STREAM_COUNT,
-        memory_limit,
-    );
 }
 
 #[test]

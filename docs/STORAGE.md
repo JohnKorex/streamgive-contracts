@@ -44,6 +44,10 @@ counts below assume a 5-second average ledger close time
 | `Registry` | Instance | 30d / 29d | Optional NGO registry consulted during stream creation and transfer. |
 | `AdminRenounced` | Instance | 30d / 29d | Permanent marker that disables all admin-gated calls after renunciation. |
 | `Stream(u64)` | Persistent | 90d / 89d | One donor→NGO stream record, keyed by stream id. Extended on every `create_stream`, `withdraw`, `top_up`, `cancel_stream`, or rate change touching that stream. |
+| `NgoStreamSlots(Address)` | Persistent | 90d / 89d | Number of slots ever allocated in the NGO's paged index. |
+| `NgoStreamPage(Address, u32)` | Persistent | 90d / 89d | Up to ten stream slots. Empty pages are removed when pruning. |
+| `NgoStreamSlot(u64)` | Persistent | 90d / 89d | Reverse position of a live stream, removed when it leaves the index. |
+| `NgoStreams(Address)` | Persistent | Legacy | Read-only index prefix for upgraded vaults. |
 
 All instance keys share one TTL (bumped to 30 days, refreshed once it
 would otherwise drop below 29 days remaining) via `extend_instance_ttl`,
@@ -51,6 +55,11 @@ called on every state-changing entry point. Each `Stream(u64)` entry gets
 its own 90-day TTL via `extend_stream_ttl`, called whenever that specific
 stream is touched — an untouched stream can still expire independently of
 the instance and of other streams.
+
+A new stream adds to one page and updates one slot counter and one reverse
+position. Ten slots bound the size rewritten by an append and let a
+20-slot withdrawal window read at most three modern pages. Entries can be
+restored after archival like other persistent vault state.
 
 On cancellation, the stream TTL is bumped to the normal 90-day retention
 period plus the configured `cancel_grace_ledgers`. This gives indexers a

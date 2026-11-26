@@ -274,12 +274,20 @@ sequenceDiagram
 ## Fork: sweep an NGO's streams (`withdraw_all`)
 
 `withdraw_all` collects from an NGO's streams a bounded page at a time without
-the caller having to know any stream ids: it reads the NGO's stream index in
-creation order and settles the slice `[start, start + limit)`, exactly like
+the caller having to know any stream ids: it reads the NGO's stream index
+in insertion order, skips vacant slots, and settles the rest exactly as
 `withdraw_batch` does. `limit` is clamped to `MAX_BATCH_WITHDRAW_STREAMS` (20).
 The call returns `WithdrawAllPage { amounts, next }`, where `amounts` holds the
 net payout per stream in page order and `next` is the cursor to pass as `start`
-on the next call. Paging is done when `next` reaches the NGO's stream count.
+on the next call. Paging is done when `next` reaches `ngo_stream_slots(ngo)`.
+
+Both `withdraw_all` and `streams_by_ngo` use stable slot offsets. Cancelled,
+rescued, drained, and transferred streams vacate their old slots without
+shifting later ones. An empty window may be followed by more live streams.
+When paging through `streams_by_ngo`, advance by the clamped limit instead of
+the number of returned IDs. A top-up that reactivates a drained stream adds
+it at the end. Upgraded deployments retain the legacy index as a read-only
+prefix, filtered against current stream state.
 
 Unlike `withdraw_batch`, a page that has accrued nothing is **not** an error: it
 returns one `0` per stream and advances the cursor, so a dormant page in the
@@ -296,8 +304,8 @@ sequenceDiagram
 
     NGO->>Vault: withdraw_all(ngo, start, limit)
     activate Vault
-    Vault->>Vault: validate pause; read NgoStreams index; clamp limit to 20
-    Vault->>Vault: page = index[start .. start + limit]
+    Vault->>Vault: validate pause; read NGO index slots; clamp limit to 20
+    Vault->>Vault: page = live entries in slots[start .. start + limit]
     Vault->>Vault: settle page as withdraw_batch(page)
     alt page accrued nothing
         Vault-->>NGO: WithdrawAllPage { amounts: [0, ...], next }

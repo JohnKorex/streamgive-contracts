@@ -366,8 +366,8 @@ pub struct WithdrawAllPage {
     /// had nothing to withdraw contributes `0`.
     pub amounts: Vec<i128>,
     /// The `start` to pass on the next call: one past the end of this page,
-    /// clamped to the NGO's stream count. Iteration is complete once it
-    /// reaches that count (see `streams_by_ngo`).
+    /// clamped to the NGO's slot count. Iteration is complete once it
+    /// reaches that count (see `ngo_stream_slots`).
     pub next: u32,
 }
 
@@ -403,7 +403,7 @@ pub enum DataKey {
     TotalWithdrawn,
     /// Lifetime protocol fees collected and sent to the treasury.
     TotalFeesCollected,
-    /// Stream ids currently associated with an NGO.
+    /// Legacy NGO stream index. Retained as a read-only prefix after upgrade.
     NgoStreams(Address),
     /// The token allowlist surfaced to frontend token pickers. See
     /// [`allowed_tokens`](DonationVault::allowed_tokens); empty until an
@@ -443,6 +443,12 @@ pub enum DataKey {
     /// `modify_rate` accept. Absent (or zero) means no minimum. See
     /// `set_min_duration` and issue #340.
     MinDuration,
+    /// Next slot in the paged index for an NGO, excluding legacy slots.
+    NgoStreamSlots(Address),
+    /// Fixed-size page of slots with retired or reassigned streams removed.
+    NgoStreamPage(Address, u32),
+    /// Position of a stream in its current NGO's paged index.
+    NgoStreamSlot(u64),
 }
 
 #[contracterror]
@@ -579,6 +585,8 @@ pub const MAX_BATCH_CANCEL_STREAMS: u32 = 20;
 
 /// Maximum number of NGO stream ids returned by `streams_by_ngo` in one page.
 pub const MAX_STREAMS_BY_NGO: u32 = 100;
+
+const NGO_STREAM_PAGE_SIZE: u32 = 10;
 
 const MAX_FEE_BPS: u32 = 1_000;
 
@@ -723,6 +731,96 @@ fn add_committed(env: &Env, token: &Address, delta: i128) -> Result<(), Error> {
         .ok_or(Error::ArithmeticOverflow)?;
     set_committed(env, token, next);
     Ok(())
+}
+
+fn append_ngo_stream(env: &Env, ngo: &Address, stream_id: u64) -> Result<(), Error> {
+    let storage = env.storage().persistent();
+    let count_key = DataKey::NgoStreamSlots(ngo.clone());
+    let slot: u32 = storage.get(&count_key).unwrap_or(0);
+    let next = slot.checked_add(1).ok_or(Error::ArithmeticOverflow)?;
+    let page_key = DataKey::NgoStreamPage(ngo.clone(), slot / NGO_STREAM_PAGE_SIZE);
+    let mut page: Vec<Option<u64>> = storage.get(&page_key).unwrap_or_else(|| Vec::new(env));
+    for _ in page.len()..slot % NGO_STREAM_PAGE_SIZE {
+        page.push_back(None);
+    }
+    page.push_back(Some(stream_id));
+
+    let slot_key = DataKey::NgoStreamSlot(stream_id);
+    storage.set(&count_key, &next);
+    storage.set(&page_key, &page);
+    storage.set(&slot_key, &slot);
+    for key in [&count_key, &page_key, &slot_key] {
+        storage.extend_ttl(key, STREAM_LIFETIME_THRESHOLD, STREAM_BUMP_AMOUNT);
+    }
+    Ok(())
+}
+
+fn remove_ngo_stream(env: &Env, ngo: &Address, stream_id: u64) {
+    let storage = env.storage().persistent();
+    let slot_key = DataKey::NgoStreamSlot(stream_id);
+    let Some(slot) = storage.get::<_, u32>(&slot_key) else {
+        // Legacy positions are filtered against the current stream on read.
+        return;
+    };
+    let page_key = DataKey::NgoStreamPage(ngo.clone(), slot / NGO_STREAM_PAGE_SIZE);
+    if let Some(mut page) = storage.get::<_, Vec<Option<u64>>>(&page_key) {
+        page.set(slot % NGO_STREAM_PAGE_SIZE, None);
+        if page.iter().all(|entry| entry.is_none()) {
+            storage.remove(&page_key);
+        } else {
+            storage.set(&page_key, &page);
+        }
+    }
+    storage.remove(&slot_key);
+}
+
+fn ngo_stream_window(env: &Env, ngo: &Address, start: u32, limit: u32) -> (Vec<u64>, u32) {
+    let storage = env.storage().persistent();
+    let legacy: Vec<u64> = storage
+        .get(&DataKey::NgoStreams(ngo.clone()))
+        .unwrap_or_else(|| Vec::new(env));
+    let modern: u32 = storage
+        .get(&DataKey::NgoStreamSlots(ngo.clone()))
+        .unwrap_or(0);
+    let total = legacy.len().saturating_add(modern);
+    let mut ids = Vec::new(env);
+    if limit == 0 || start >= total {
+        return (ids, total);
+    }
+
+    let end = start.saturating_add(limit).min(total);
+    for position in start..end.min(legacy.len()) {
+        if let Some(id) = legacy.get(position) {
+            if storage.has(&DataKey::NgoStreamSlot(id)) {
+                continue;
+            }
+            if let Some(stream) = storage.get::<_, Stream>(&DataKey::Stream(id)) {
+                if stream.ngo == *ngo
+                    && matches!(stream.status, StreamStatus::Active | StreamStatus::Paused)
+                {
+                    ids.push_back(id);
+                }
+            }
+        }
+    }
+
+    let mut slot = start.saturating_sub(legacy.len());
+    let modern_end = end.saturating_sub(legacy.len());
+    while slot < modern_end {
+        let segment_end = slot
+            .saturating_add(NGO_STREAM_PAGE_SIZE - slot % NGO_STREAM_PAGE_SIZE)
+            .min(modern_end);
+        let key = DataKey::NgoStreamPage(ngo.clone(), slot / NGO_STREAM_PAGE_SIZE);
+        if let Some(page) = storage.get::<_, Vec<Option<u64>>>(&key) {
+            for position in slot..segment_end {
+                if let Some(Some(id)) = page.get(position % NGO_STREAM_PAGE_SIZE) {
+                    ids.push_back(id);
+                }
+            }
+        }
+        slot = segment_end;
+    }
+    (ids, end)
 }
 
 /// If an NGO registry is configured, verifies that `ngo` is approved/verified.
@@ -976,6 +1074,7 @@ fn settle(env: &Env, stream_id: u64, stream: &mut Stream, now: u64) -> Result<i1
     let was_active = stream.status == StreamStatus::Active;
     let accrued = settle_core(env, stream, now)?;
     if was_active && stream.status == StreamStatus::Drained {
+        remove_ngo_stream(env, &stream.ngo, stream_id);
         DrainedEvent {
             stream_id,
             total_paid: stream.withdrawn,
@@ -1010,6 +1109,7 @@ fn cancel_stream_inner(
     stream.cancelled = true;
     stream.last_update = now;
     stream.status = StreamStatus::Cancelled;
+    remove_ngo_stream(env, &stream.ngo, stream_id);
     env.storage()
         .persistent()
         .set(&DataKey::Stream(stream_id), &stream);
@@ -1176,17 +1276,7 @@ fn create_stream_inner(
     env.storage()
         .persistent()
         .set(&DataKey::Stream(stream_id), &stream);
-    let ngo_key = DataKey::NgoStreams(ngo.clone());
-    let mut ngo_streams: Vec<u64> = env
-        .storage()
-        .persistent()
-        .get(&ngo_key)
-        .unwrap_or_else(|| Vec::new(&env));
-    ngo_streams.push_back(stream_id);
-    env.storage().persistent().set(&ngo_key, &ngo_streams);
-    env.storage()
-        .persistent()
-        .extend_ttl(&ngo_key, STREAM_LIFETIME_THRESHOLD, STREAM_BUMP_AMOUNT);
+    append_ngo_stream(&env, &ngo, stream_id)?;
     let next_stream_id = stream_id.checked_add(1).ok_or(Error::ArithmeticOverflow)?;
     env.storage()
         .instance()
@@ -1638,26 +1728,20 @@ impl DonationVault {
             .unwrap_or(0)
     }
 
-    /// Lists stream ids associated with an NGO in creation order.
-    /// Results are bounded by `limit`, which is clamped to `MAX_STREAMS_BY_NGO`.
+    /// Lists active and paused stream IDs in the requested NGO index slots.
+    /// Slots left by finished or transferred streams are omitted from results.
+    /// Advance by the requested limit (clamped to `MAX_STREAMS_BY_NGO`), not
+    /// the number of IDs returned, until reaching `ngo_stream_slots`.
     pub fn streams_by_ngo(env: Env, ngo: Address, start: u32, limit: u32) -> Vec<u64> {
-        let ngo_streams: Vec<u64> = env
-            .storage()
-            .persistent()
-            .get(&DataKey::NgoStreams(ngo))
-            .unwrap_or_else(|| Vec::new(&env));
-        let capped = limit.min(MAX_STREAMS_BY_NGO);
-        let mut ids = Vec::new(&env);
-        if start >= ngo_streams.len() {
-            return ids;
-        }
-        let end = start.saturating_add(capped).min(ngo_streams.len());
-        for i in start..end {
-            if let Some(id) = ngo_streams.get(i) {
-                ids.push_back(id);
-            }
-        }
-        ids
+        ngo_stream_window(&env, &ngo, start, limit.min(MAX_STREAMS_BY_NGO)).0
+    }
+
+    /// Returns the exclusive upper bound for the NGO's stream slot cursors.
+    pub fn ngo_stream_slots(env: Env, ngo: Address) -> u32 {
+        let storage = env.storage().persistent();
+        let legacy: Option<Vec<u64>> = storage.get(&DataKey::NgoStreams(ngo.clone()));
+        let modern: u32 = storage.get(&DataKey::NgoStreamSlots(ngo)).unwrap_or(0);
+        legacy.map_or(0, |ids| ids.len()).saturating_add(modern)
     }
 
     /// Reads back the number of streams ever created — the exclusive upper
@@ -3037,6 +3121,7 @@ impl DonationVault {
         let drained = stream.balance == 0;
         if drained {
             stream.status = StreamStatus::Drained;
+            remove_ngo_stream(&env, &stream.ngo, stream_id);
         }
         env.storage().persistent().set(&key, &stream);
         extend_instance_ttl(&env);
@@ -3202,6 +3287,7 @@ impl DonationVault {
             stream.last_update = now;
             if stream.balance == 0 {
                 stream.status = StreamStatus::Drained;
+                remove_ngo_stream(&env, &stream.ngo, stream_id);
                 drained_totals.set(stream_id, stream.withdrawn);
             }
             env.storage().persistent().set(&key, &stream);
@@ -3327,13 +3413,10 @@ impl DonationVault {
     /// the NGO's stream index so the caller never has to list stream ids
     /// off-chain (issue #342).
     ///
-    /// `start` and `limit` select the page: streams are taken from the NGO's
-    /// index in creation order from position `start`, up to `limit` of them.
-    /// `limit` is clamped to `MAX_BATCH_WITHDRAW_STREAMS`, matching
-    /// `withdraw_batch`'s footprint budget. Each stream is settled exactly as
-    /// `withdraw` would, and the page is returned with the cursor to pass as
-    /// `start` next time; iteration is complete when `next` reaches the NGO's
-    /// stream count (`streams_by_ngo(ngo, 0, ..).len()`).
+    /// `start` and `limit` select a window of stable NGO index slots. Vacant
+    /// slots are skipped. The limit is clamped to `MAX_BATCH_WITHDRAW_STREAMS`.
+    /// Each stream is settled as in `withdraw`, and iteration is complete
+    /// when `next` reaches `ngo_stream_slots(ngo)`.
     ///
     /// The NGO authorizes the call once. A page whose streams have all accrued
     /// nothing is not an error: it returns one `0` per stream in the page, so
@@ -3373,32 +3456,8 @@ impl DonationVault {
     ) -> Result<WithdrawAllPage, Error> {
         require_not_paused(&env)?;
 
-        let index: Vec<u64> = env
-            .storage()
-            .persistent()
-            .get(&DataKey::NgoStreams(ngo))
-            .unwrap_or_else(|| Vec::new(&env));
-        let total = index.len();
-
-        if limit == 0 || start >= total {
-            return Ok(WithdrawAllPage {
-                amounts: Vec::new(&env),
-                next: total,
-            });
-        }
-
-        let effective_limit = limit.min(MAX_BATCH_WITHDRAW_STREAMS);
-        let end = start
-            .checked_add(effective_limit)
-            .unwrap_or(total)
-            .min(total);
-
-        let mut page = Vec::new(&env);
-        for position in start..end {
-            if let Some(stream_id) = index.get(position) {
-                page.push_back(stream_id);
-            }
-        }
+        let (page, end) =
+            ngo_stream_window(&env, &ngo, start, limit.min(MAX_BATCH_WITHDRAW_STREAMS));
 
         // Settle the page exactly like `withdraw_batch` (one transfer per
         // token plus a `withdraw` event per stream). A page that accrues
@@ -3686,6 +3745,7 @@ impl DonationVault {
         stream.cancelled = true;
         stream.last_update = now;
         stream.status = StreamStatus::Cancelled;
+        remove_ngo_stream(&env, &stream.ngo, stream_id);
         env.storage().persistent().set(&key, &stream);
         extend_instance_ttl(&env);
         let grace_ledgers = env
@@ -3768,6 +3828,7 @@ impl DonationVault {
         let token_client = token::Client::new(&env, &stream.token);
 
         let now = env.ledger().timestamp();
+        let was_drained = stream.status == StreamStatus::Drained;
         let settled = settle_core(&env, &mut stream, now)?;
 
         // Update state before the external token transfer
@@ -3779,6 +3840,9 @@ impl DonationVault {
         // Reactivate a drained stream if it now has a positive balance
         if stream.status == StreamStatus::Drained && stream.balance > 0 {
             stream.status = StreamStatus::Active;
+            if was_drained {
+                append_ngo_stream(&env, &stream.ngo, stream_id)?;
+            }
         }
 
         let total_donated: i128 = env
@@ -3957,29 +4021,10 @@ impl DonationVault {
 
         env.storage().persistent().set(&key, &stream);
 
-        let old_key = DataKey::NgoStreams(old_ngo.clone());
-        if let Some(old_streams) = env.storage().persistent().get::<_, Vec<u64>>(&old_key) {
-            let mut remaining = Vec::new(&env);
-            for id in old_streams.iter() {
-                if id != stream_id {
-                    remaining.push_back(id);
-                }
-            }
-            env.storage().persistent().set(&old_key, &remaining);
+        remove_ngo_stream(&env, &old_ngo, stream_id);
+        if matches!(stream.status, StreamStatus::Active | StreamStatus::Paused) {
+            append_ngo_stream(&env, &new_ngo, stream_id)?;
         }
-        let new_key = DataKey::NgoStreams(new_ngo.clone());
-        let mut new_streams: Vec<u64> = env
-            .storage()
-            .persistent()
-            .get(&new_key)
-            .unwrap_or_else(|| Vec::new(&env));
-        new_streams.push_back(stream_id);
-        env.storage().persistent().set(&new_key, &new_streams);
-        env.storage().persistent().extend_ttl(
-            &new_key,
-            STREAM_LIFETIME_THRESHOLD,
-            STREAM_BUMP_AMOUNT,
-        );
         extend_instance_ttl(&env);
         extend_stream_ttl(&env, stream_id);
 

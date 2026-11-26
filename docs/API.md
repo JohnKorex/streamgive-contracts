@@ -25,6 +25,7 @@ abort the invocation.
 | `get_streams` | `ids: Vec<u64>` / `Result<Vec<Option<Stream>>, Error>` | none | `BatchLimitExceeded` | — |
 | `streams_by_donor` | `donor: Address` / `Vec<u64>` | none | — | — |
 | `streams_by_ngo` | `ngo: Address, start: u32, limit: u32` / `Vec<u64>` | none | — | — |
+| `ngo_stream_slots` | `ngo: Address` / `u32` | none | — | — |
 | `stream_count` | none / `u64` | none | — | — |
 | `pending_accrual` | `stream_id: u64` / `Result<i128, Error>` | none | `StreamNotFound` | — |
 | `depletion_time` | `stream_id: u64` / `Result<Option<u64>, Error>` | none | `StreamNotFound` | — |
